@@ -3270,6 +3270,8 @@ static void pktgen_reset_all_threads(struct pktgen_net *pn)
 	pktgen_wait_all_threads_run(pn);
 }
 
+#define PKT_SKB_BATCH	8
+
 static void show_results(struct pktgen_dev *pkt_dev, int nr_frags)
 {
 	__u64 bps, mbps, pps;
@@ -3282,7 +3284,7 @@ static void show_results(struct pktgen_dev *pkt_dev, int nr_frags)
 		     (unsigned long long)ktime_to_us(elapsed),
 		     (unsigned long long)ktime_to_us(ktime_sub(elapsed, idle)),
 		     (unsigned long long)ktime_to_us(idle),
-		     (unsigned long long)pkt_dev->sofar,
+		     (unsigned long long)pkt_dev->sofar * PKT_SKB_BATCH,
 		     pkt_dev->cur_pkt_size, nr_frags);
 
 	pps = div64_u64(pkt_dev->sofar * NSEC_PER_SEC,
@@ -3299,7 +3301,7 @@ static void show_results(struct pktgen_dev *pkt_dev, int nr_frags)
 		}
 		bps = div64_u64(bps * 8 * NSEC_PER_SEC, ktime_to_ns(elapsed));
 	} else {
-		bps = pps * 8 * pkt_dev->cur_pkt_size;
+		bps = pps * 8 * pkt_dev->cur_pkt_size * PKT_SKB_BATCH;
 	}
 
 	mbps = bps;
@@ -3442,10 +3444,12 @@ static void pktgen_wait_for_skb(struct pktgen_dev *pkt_dev)
 static void pktgen_xmit(struct pktgen_dev *pkt_dev)
 {
 	unsigned int burst = READ_ONCE(pkt_dev->burst);
+	struct sk_buff *batch_skb[PKT_SKB_BATCH];
 	struct net_device *odev = pkt_dev->odev;
 	struct netdev_queue *txq;
+	int ret, num_skbs = 0, i;
+	LIST_HEAD(skb_list);
 	struct sk_buff *skb;
-	int ret;
 
 	/* If device is offline, then don't send */
 	if (unlikely(!netif_running(odev) || !netif_carrier_ok(odev))) {
@@ -3461,51 +3465,57 @@ static void pktgen_xmit(struct pktgen_dev *pkt_dev)
 		return;
 	}
 
-	/* If no skb or clone count exhausted then get new one */
-	if (!pkt_dev->skb || (pkt_dev->last_ok &&
-			      ++pkt_dev->clone_count >= pkt_dev->clone_skb)) {
+	for (i = 0; i < PKT_SKB_BATCH; i++) {
 		/* build a new pkt */
-		kfree_skb(pkt_dev->skb);
-
-		pkt_dev->skb = fill_packet(odev, pkt_dev);
-		if (pkt_dev->skb == NULL) {
+		skb = fill_packet(odev, pkt_dev);
+		if (skb == NULL) {
 			pr_err("ERROR: couldn't allocate skb in fill_packet\n");
 			schedule();
-			pkt_dev->clone_count--;	/* back out increment, OOM */
 			return;
 		}
-		pkt_dev->last_pkt_size = pkt_dev->skb->len;
-		pkt_dev->clone_count = 0;	/* reset counter */
+		batch_skb[num_skbs++] = skb;
 	}
+	pkt_dev->clone_count = 0;	/* reset counter */
+	pkt_dev->last_pkt_size = skb->len;
 
 	if (pkt_dev->delay && pkt_dev->last_ok)
 		spin(pkt_dev, pkt_dev->next_tx);
 
 	if (pkt_dev->xmit_mode == M_NETIF_RECEIVE) {
-		skb = pkt_dev->skb;
-		skb->protocol = eth_type_trans(skb, skb->dev);
-		refcount_add(burst, &skb->users);
+		for (i = 0; i < num_skbs; i++) {
+			skb = batch_skb[i];
+			list_add_tail(&skb->list, &skb_list);
+			skb->protocol = eth_type_trans(skb, skb->dev);
+			refcount_add(burst, &skb->users);
+		}
 		local_bh_disable();
 		do {
-			ret = netif_receive_skb(skb);
-			if (ret == NET_RX_DROP)
-				pkt_dev->errors++;
+			netif_receive_skb_list(&skb_list);
 			pkt_dev->sofar++;
 			pkt_dev->seq_num++;
-			if (refcount_read(&skb->users) != burst) {
-				/* skb was queued by rps/rfs or taps,
-				 * so cannot reuse this skb
+
+			if (!list_empty(&skb_list))
+				pr_info("pktgen: skb_list not empty!\n");
+
+			for (i = 0; i < num_skbs; i++) {
+				skb = batch_skb[i];
+				if (refcount_read(&skb->users) != burst) {
+					/* skb was queued by rps/rfs or taps,
+					 * so cannot reuse this skb
+					 */
+					WARN_ON(refcount_sub_and_test(burst - 1, &skb->users));
+					/* get out of the loop and wait
+					 * until skb is consumed
+					 */
+					pr_info("pktgen: users mismatches burst!\n");
+					goto out;
+				}
+				/* skb was 'freed' by stack, so clean few
+				 * bits and reuse it
 				 */
-				WARN_ON(refcount_sub_and_test(burst - 1, &skb->users));
-				/* get out of the loop and wait
-				 * until skb is consumed
-				 */
-				break;
+				skb_reset_redirect(skb);
+				list_add_tail(&skb->list, &skb_list);
 			}
-			/* skb was 'freed' by stack, so clean few
-			 * bits and reuse it
-			 */
-			skb_reset_redirect(skb);
 		} while (--burst > 0);
 		goto out; /* Skips xmit_mode M_START_XMIT */
 	} else if (pkt_dev->xmit_mode == M_QUEUE_XMIT) {
@@ -3587,12 +3597,18 @@ unlock:
 out:
 	local_bh_enable();
 
+	//pr_info("pktgen: count %llu sofar %llu\n", pkt_dev->count, pkt_dev->sofar);
+
 	/* If pkt_dev->count is zero, then run forever */
 	if ((pkt_dev->count != 0) && (pkt_dev->sofar >= pkt_dev->count)) {
-		pktgen_wait_for_skb(pkt_dev);
+		for (i = 0; i < num_skbs; i++) {
+			skb = batch_skb[i];
+			pkt_dev->skb = skb;
+			pktgen_wait_for_skb(pkt_dev);
 
-		/* Done with this */
-		pktgen_stop_device(pkt_dev);
+			/* Done with this */
+			pktgen_stop_device(pkt_dev);
+		}
 	}
 }
 

@@ -70,6 +70,9 @@ for ((thread = $F_THREAD; thread <= $L_THREAD; thread++)); do
     pg_set $dev "delay $DELAY"
     pg_set $dev "flag NO_TIMESTAMP"
 
+    # Source
+    pg_set $dev "src_min 192.168.2.123"
+
     # Destination
     pg_set $dev "dst_mac $DST_MAC"
     pg_set $dev "dst${IP6}_min $DST_MIN"
