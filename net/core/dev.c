@@ -3612,6 +3612,7 @@ out:
 	*ret = rc;
 	return skb;
 }
+EXPORT_SYMBOL_GPL(dev_hard_start_xmit);
 
 static struct sk_buff *validate_xmit_vlan(struct sk_buff *skb,
 					  netdev_features_t features)
@@ -4104,6 +4105,7 @@ struct netdev_queue *netdev_core_pick_tx(struct net_device *dev,
 	skb_set_queue_mapping(skb, queue_index);
 	return netdev_get_tx_queue(dev, queue_index);
 }
+EXPORT_SYMBOL_GPL(netdev_core_pick_tx);
 
 /**
  *	__dev_queue_xmit - transmit a buffer

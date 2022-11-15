@@ -365,6 +365,7 @@ bool sch_direct_xmit(struct sk_buff *skb, struct Qdisc *q,
 
 	return true;
 }
+EXPORT_SYMBOL(sch_direct_xmit);
 
 /*
  * NOTE: Called under qdisc_lock(q) with locally disabled BH.
@@ -424,6 +425,7 @@ void __qdisc_run(struct Qdisc *q)
 		}
 	}
 }
+EXPORT_SYMBOL_GPL(__qdisc_run);
 
 unsigned long dev_trans_start(struct net_device *dev)
 {
