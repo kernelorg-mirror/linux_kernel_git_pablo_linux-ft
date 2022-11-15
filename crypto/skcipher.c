@@ -283,7 +283,7 @@ ok:
 	return 0;
 }
 
-static int skcipher_next_copy(struct skcipher_walk *walk)
+/*static int skcipher_next_copy(struct skcipher_walk *walk)
 {
 	struct skcipher_walk_buffer *p;
 	u8 *tmp = walk->page;
@@ -314,7 +314,7 @@ static int skcipher_next_copy(struct skcipher_walk *walk)
 
 	return 0;
 }
-
+*/
 static int skcipher_next_fast(struct skcipher_walk *walk)
 {
 	unsigned long diff;
@@ -359,7 +359,7 @@ static int skcipher_walk_next(struct skcipher_walk *walk)
 		if (unlikely(walk->total < walk->blocksize))
 			return skcipher_walk_done(walk, -EINVAL);
 
-slow_path:
+//slow_path:
 		err = skcipher_next_slow(walk, bsize);
 		goto set_phys_lowmem;
 	}
