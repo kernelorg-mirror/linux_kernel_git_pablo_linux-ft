@@ -606,8 +606,17 @@ struct xfrm_mgr {
 void xfrm_register_km(struct xfrm_mgr *km);
 void xfrm_unregister_km(struct xfrm_mgr *km);
 
+struct xfrm_bulk_skb_cb {
+	/* Unused, aligned with iif in inet_skb_parm and inet6_skb_parm */
+	int	iif;
+	int	err;
+	struct xfrm_state *x;
+};
+#define XFRM_BULK_SKB_CB(__skb) ((struct xfrm_bulk_skb_cb *)&((__skb)->cb[0]))
+
 struct xfrm_tunnel_skb_cb {
 	union {
+		struct xfrm_bulk_skb_cb xbcb;
 		struct nft_bulk_cb ncb;
 		struct inet_skb_parm h4;
 		struct inet6_skb_parm h6;

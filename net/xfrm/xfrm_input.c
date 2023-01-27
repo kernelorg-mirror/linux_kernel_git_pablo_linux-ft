@@ -731,6 +731,8 @@ int xfrm_input_list(struct sk_buff **skbp, int nexthdr, __be32 spi, int encap_ty
 	list_for_each_entry_safe(skb, nskb, &head, list) {
 		nexthdr = XFRM_MODE_SKB_CB(skb)->protocol;
 
+		XFRM_BULK_SKB_CB(skb)->x = x;
+
 		err = xfrm_input_loop(net, skb, x, spi, nexthdr, -1);
 		if (err) {
 			skb_list_del_init(skb);
