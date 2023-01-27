@@ -222,6 +222,7 @@ static inline __s32 nf_flow_timeout_delta(unsigned int timeout)
 struct nf_flow_route {
 	struct {
 		struct dst_entry		*dst;
+		struct dst_entry		*orig_dst;
 		struct {
 			u32			ifindex;
 			struct {

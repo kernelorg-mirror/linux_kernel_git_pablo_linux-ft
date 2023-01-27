@@ -525,6 +525,41 @@ tx_err_dst_release:
 	return err;
 }
 
+static int xfrmi_fill_forward_path(struct net_device_path_ctx *ctx,
+				   struct net_device_path *path)
+{
+	struct xfrm_if *xi = netdev_priv(ctx->dev);
+	struct dst_entry *dst;
+	struct xfrm_state *x;
+
+	ctx->flowi.flowi_oif = xi->p.link;
+
+	/* ctx.dst already holds reference to dst. */
+	dst = xfrm_lookup_with_ifid(xi->net, ctx->dst, &ctx->flowi, NULL, 0,
+				    xi->p.if_id);
+	if (IS_ERR(dst))
+		return -1;
+
+	x = dst->xfrm;
+	if (!x)
+		goto err_fill_forward;
+
+	if (x->if_id != xi->p.if_id)
+		goto err_fill_forward;
+
+	path->type = DEV_PATH_TUNNEL;
+	path->tun.dst = dst;
+	path->dev = ctx->dev;
+	ctx->dev = dst->dev;
+
+	return 0;
+
+err_fill_forward:
+	dst_release(dst);
+
+	return -1;
+}
+
 static netdev_tx_t xfrmi_xmit(struct sk_buff *skb, struct net_device *dev)
 {
 	struct xfrm_if *xi = netdev_priv(dev);
@@ -737,6 +772,7 @@ static const struct net_device_ops xfrmi_netdev_ops = {
 	.ndo_start_xmit = xfrmi_xmit,
 	.ndo_get_stats64 = dev_get_tstats64,
 	.ndo_get_iflink = xfrmi_get_iflink,
+	.ndo_fill_forward_path = xfrmi_fill_forward_path,
 };
 
 static void xfrmi_dev_setup(struct net_device *dev)
