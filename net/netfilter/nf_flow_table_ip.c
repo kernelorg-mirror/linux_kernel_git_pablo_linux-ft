@@ -1054,6 +1054,7 @@ static int nf_flow_tuple_ipv6(struct nf_flowtable_ctx *ctx, struct sk_buff *skb,
 			      struct flow_offload_tuple *tuple)
 {
 	struct flow_ports *ports;
+	struct ip_esp_hdr *esph;
 	struct ipv6hdr *ip6h;
 	unsigned int thoff;
 	u8 nexthdr;
@@ -1077,6 +1078,9 @@ static int nf_flow_tuple_ipv6(struct nf_flowtable_ctx *ctx, struct sk_buff *skb,
 		ctx->hdrsize = sizeof(struct gre_base_hdr);
 		break;
 #endif
+	case IPPROTO_ESP:
+		ctx->hdrsize = sizeof(struct ip_esp_hdr);
+		break;
 	default:
 		return -1;
 	}
@@ -1100,8 +1104,12 @@ static int nf_flow_tuple_ipv6(struct nf_flowtable_ctx *ctx, struct sk_buff *skb,
 		greh = (struct gre_base_hdr *)(skb_network_header(skb) + thoff);
 		if ((greh->flags & GRE_VERSION) != GRE_VERSION_0)
 			return -1;
+		}
 		break;
-	}
+	case IPPROTO_ESP:
+		esph = (struct ip_esp_hdr *)(skb_network_header(skb) + thoff);
+		tuple->spi		= esph->spi;
+		break;
 	}
 
 	ip6h = (struct ipv6hdr *)(skb_network_header(skb) + ctx->offset);
@@ -1112,6 +1120,20 @@ static int nf_flow_tuple_ipv6(struct nf_flowtable_ctx *ctx, struct sk_buff *skb,
 	tuple->l4proto		= nexthdr;
 	tuple->iifidx		= ctx->in->ifindex;
 	nf_flow_tuple_encap(skb, tuple);
+
+	/*
+	if (ip6h->nexthdr == IPPROTO_ESP) {
+		pr_info("lookup: %pI6 -> %pI6 l3proto=%u l4proto=%u spi=%x iif=%u\n",
+			&tuple->src_v6, &tuple->dst_v6,
+			tuple->l3proto, tuple->l4proto,
+			tuple->spi, tuple->iifidx);
+	} else {
+		pr_info("lookup: %pI6 -> %pI6 l3proto=%u l4proto=%u iif=%u\n",
+			&tuple->src_v6, &tuple->dst_v6,
+			tuple->l3proto, tuple->l4proto,
+			tuple->iifidx);
+	}
+	*/
 
 	return 0;
 }
@@ -1238,6 +1260,83 @@ nf_flow_offload_ipv6_hook(void *priv, struct sk_buff *skb,
 }
 EXPORT_SYMBOL_GPL(nf_flow_offload_ipv6_hook);
 
+static int nft_esp_bulk_ipv6_receive(struct list_head *head, struct sk_buff *skb)
+{
+	const struct ipv6hdr *ip6h;
+	struct in6_addr daddr;
+	struct xfrm_state *x;
+	struct sec_path *sp;
+	unsigned int thoff;
+	struct sk_buff *p;
+	__be32 spi;
+
+	if (xfrm_offload(skb))
+		return -EINVAL;
+
+	ip6h = ipv6_hdr(skb);
+	thoff = sizeof(struct ipv6hdr);
+	skb_reset_network_header(skb);
+	skb_set_transport_header(skb, thoff);
+
+	daddr = ip6h->daddr;
+
+	BUG_ON(ip6h->nexthdr != IPPROTO_ESP);
+
+	spi = ip_esp_hdr(skb)->spi;
+
+	XFRM_SPI_SKB_CB(skb)->family = AF_INET6;
+	XFRM_SPI_SKB_CB(skb)->daddroff = offsetof(struct ipv6hdr, daddr);
+	XFRM_SPI_SKB_CB(skb)->seq = ip_esp_hdr(skb)->seq_no;
+	XFRM_SPI_SKB_CB(skb)->spi = spi;
+
+	list_for_each_entry(p, head, list) {
+		if (p->protocol != htons(ETH_P_IPV6))
+			continue;
+
+		if (!ipv6_addr_equal(&daddr, &ipv6_hdr(p)->daddr))
+			continue;
+
+		if (spi != ip_esp_hdr(p)->spi)
+			continue;
+
+		goto found;
+	}
+
+	goto out;
+
+found:
+	if (NFT_BULK_CB(p)->last == p)
+		skb_shinfo(p)->frag_list = skb;
+	else
+		NFT_BULK_CB(p)->last->next = skb;
+
+	NFT_BULK_CB(p)->last = skb;
+	skb_pull(skb, sizeof(*ip6h));
+	/* XXX: Copy or alloc new one? */
+	__skb_ext_copy(skb, p);
+
+	return 0;
+out:
+	/* First skb */
+	NFT_BULK_CB(skb)->last = skb;
+	list_add_tail(&skb->list, head);
+
+	x = xfrm_state_lookup(dev_net(skb->dev), skb->mark,
+			(xfrm_address_t *)&daddr,
+			spi, IPPROTO_ESP, AF_INET6);
+	if (!x)
+		return -ENOENT;
+
+	sp = secpath_set(skb);
+	if (!sp)
+		return -ENOMEM;
+
+	sp->xvec[sp->len++] = x;
+	skb_pull(skb, sizeof(*ip6h));
+
+	return 0;
+}
+
 static void nft_bulk_ipv6_receive(struct list_head *head, struct sk_buff *skb)
 {
 	const struct in6_addr *daddr;
@@ -1315,6 +1414,7 @@ void __nf_flow_offload_ipv6_hook_list(void *priv, struct list_head *head,
 	struct neighbour *neigh;
 	LIST_HEAD(bulk_list);
 	LIST_HEAD(acc_list);
+	LIST_HEAD(esp_list);
 	struct rt6_info *rt;
 	int ret;
 
@@ -1330,6 +1430,12 @@ void __nf_flow_offload_ipv6_hook_list(void *priv, struct list_head *head,
 		tuplehash = nf_flow_offload_ipv6_lookup(&ctx, flow_table, skb);
 		if (!tuplehash) {
 			list_add_tail(&skb->list, &acc_list);
+			continue;
+		}
+
+		if (tuplehash->flags & FLOW_OFFLOAD_TUNNEL) {
+			/* nf_flow_encap_pop() and set transport header. */
+			list_add_tail(&skb->list, &esp_list);
 			continue;
 		}
 
@@ -1349,6 +1455,25 @@ void __nf_flow_offload_ipv6_hook_list(void *priv, struct list_head *head,
 		list_add_tail(&skb->list, &bulk_list);
 	}
 
+	list_for_each_entry_safe(skb, n, &esp_list, list) {
+		skb_list_del_init(skb);
+		memset(skb->cb, 0, sizeof(struct nft_bulk_cb));
+		ret = nft_esp_bulk_ipv6_receive(bulk_head, skb);
+		if (ret)
+			list_add_tail(&skb->list, &acc_list);
+	}
+
+	list_for_each_entry_safe(skb, n, bulk_head, list) {
+
+		list_del_init(&skb->list);
+
+		skb->next = skb_shinfo(skb)->frag_list;
+		skb_shinfo(skb)->frag_list = NULL;
+
+		ret = xfrm_input_list(&skb, IPPROTO_ESP, 0, -3);
+		/* Returns always 0 */
+	}
+
 	list_splice_init(&acc_list, head);
 
 	list_for_each_entry_safe(skb, n, &bulk_list, list) {
@@ -1365,6 +1490,13 @@ void __nf_flow_offload_ipv6_hook_list(void *priv, struct list_head *head,
 
 		tuplehash = NFT_BULK_CB(skb)->tuplehash;
 		skb_dst_set_noref(skb, tuplehash->tuple.dst_cache);
+
+		if (skb_dst(skb)->xfrm) {
+			skb = xfrm_output_list(skb);
+			if (!skb)
+				continue;
+		}
+
 		rt = (struct rt6_info *)skb_dst(skb);
 
 		neigh = ip_neigh_gw6(rt->dst.dev, rt6_nexthop(rt, &ipv6_hdr(skb)->daddr));
