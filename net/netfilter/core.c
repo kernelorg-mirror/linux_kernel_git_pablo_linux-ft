@@ -659,6 +659,34 @@ void nf_hook_slow_list(struct list_head *head, struct nf_hook_state *state,
 }
 EXPORT_SYMBOL(nf_hook_slow_list);
 
+/* Returns 1 if okfn() needs to be executed by the caller,
+ * -EPERM for NF_DROP, 0 otherwise.  Caller must hold rcu_read_lock. */
+int __nf_hook_slow_list(struct sk_buff *skb, struct nf_hook_state *state,
+			const struct nf_hook_entries *e, unsigned int s)
+{
+	unsigned int verdict;
+
+	for (; s < e->num_hook_entries; s++) {
+		verdict = nf_hook_entry_hookfn(&e->hooks[s], skb, state);
+
+		if (list_empty(state->skb_list))
+			return 0;
+
+		switch (verdict & NF_VERDICT_MASK) {
+		case NF_ACCEPT:
+			break;
+		default:
+			/* Implicit handling for NF_DROP and NF_STOLEN, as well
+			 * as any other non conventional verdicts.
+			 */
+			return 0;
+		}
+	}
+
+	return 1;
+}
+EXPORT_SYMBOL(__nf_hook_slow_list);
+
 /* This needs to be compiled in any case to avoid dependencies between the
  * nfnetlink_queue code and nf_conntrack.
  */
