@@ -526,7 +526,9 @@ EXPORT_SYMBOL_GPL(nf_flow_dnat_port);
 
 int nf_flow_table_init(struct nf_flowtable *flowtable)
 {
+	struct list_head *bulk_head;
 	int err;
+	int cpu;
 
 	INIT_DELAYED_WORK(&flowtable->gc_work, nf_flow_offload_work_gc);
 	flow_block_init(&flowtable->flow_block);
@@ -536,6 +538,17 @@ int nf_flow_table_init(struct nf_flowtable *flowtable)
 			      &nf_flow_offload_rhash_params);
 	if (err < 0)
 		return err;
+
+	flowtable->bulk_list = alloc_percpu(struct list_head);
+	if (!flowtable->bulk_list) {
+		rhashtable_destroy(&flowtable->rhashtable);
+		return -ENOMEM;
+	}
+
+	for_each_possible_cpu(cpu) {
+		bulk_head = per_cpu_ptr(flowtable->bulk_list, cpu);
+		INIT_LIST_HEAD(bulk_head);
+	}
 
 	queue_delayed_work(system_power_efficient_wq,
 			   &flowtable->gc_work, HZ);
@@ -596,6 +609,7 @@ void nf_flow_table_free(struct nf_flowtable *flow_table)
 	nf_flow_table_gc_run(flow_table);
 	nf_flow_table_offload_flush_cleanup(flow_table);
 	rhashtable_destroy(&flow_table->rhashtable);
+	free_percpu(flow_table->bulk_list);
 }
 EXPORT_SYMBOL_GPL(nf_flow_table_free);
 

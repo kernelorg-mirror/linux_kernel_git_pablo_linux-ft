@@ -3611,6 +3611,7 @@ out:
 	*ret = rc;
 	return skb;
 }
+EXPORT_SYMBOL_GPL(dev_hard_start_xmit);
 
 static struct sk_buff *validate_xmit_vlan(struct sk_buff *skb,
 					  netdev_features_t features)
@@ -3726,7 +3727,7 @@ struct sk_buff *validate_xmit_skb_list(struct sk_buff *skb, struct net_device *d
 }
 EXPORT_SYMBOL_GPL(validate_xmit_skb_list);
 
-static void qdisc_pkt_len_init(struct sk_buff *skb)
+void qdisc_pkt_len_init(struct sk_buff *skb)
 {
 	const struct skb_shared_info *shinfo = skb_shinfo(skb);
 
@@ -3766,6 +3767,7 @@ static void qdisc_pkt_len_init(struct sk_buff *skb)
 		qdisc_skb_cb(skb)->pkt_len += (gso_segs - 1) * hdr_len;
 	}
 }
+EXPORT_SYMBOL_GPL(qdisc_pkt_len_init);
 
 static int dev_qdisc_enqueue(struct sk_buff *skb, struct Qdisc *q,
 			     struct sk_buff **to_free,
@@ -4128,6 +4130,7 @@ struct netdev_queue *netdev_core_pick_tx(struct net_device *dev,
 	skb_set_queue_mapping(skb, queue_index);
 	return netdev_get_tx_queue(dev, queue_index);
 }
+EXPORT_SYMBOL_GPL(netdev_core_pick_tx);
 
 /**
  * __dev_queue_xmit() - transmit a buffer
@@ -5345,8 +5348,8 @@ skip_taps:
 			goto out;
 
 		nf_skip_egress(skb, false);
-		if (nf_ingress(skb, &pt_prev, &ret, orig_dev) < 0)
-			goto out;
+//		if (nf_ingress(skb, &pt_prev, &ret, orig_dev) < 0)
+//			goto out;
 	}
 #endif
 	skb_reset_redirect(skb);
