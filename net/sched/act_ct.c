@@ -391,7 +391,7 @@ static void tcf_ct_flow_table_add(struct tcf_ct_flow_table *ct_ft,
 		tcf_ct_flow_tc_ifidx(entry, act_ct_ext, FLOW_OFFLOAD_DIR_REPLY);
 	}
 
-	err = flow_offload_add(&ct_ft->nf_ft, entry);
+	err = flow_offload_add(&ct_ft->nf_ft, entry, NULL);
 	if (err)
 		goto err_add;
 
