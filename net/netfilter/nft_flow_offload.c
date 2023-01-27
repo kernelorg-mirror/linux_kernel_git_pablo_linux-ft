@@ -48,6 +48,7 @@ static bool nft_is_valid_ether_device(const struct net_device *dev)
 
 static int nft_dev_fill_forward_path(const struct nf_flow_route *route,
 				     const struct dst_entry *dst_cache,
+				     const struct nft_pktinfo *pkt,
 				     const struct nf_conn *ct,
 				     enum ip_conntrack_dir dir, u8 *ha,
 				     struct net_device_path_stack *stack)
@@ -74,7 +75,7 @@ static int nft_dev_fill_forward_path(const struct nf_flow_route *route,
 		return -1;
 
 out:
-	return dev_fill_forward_path(dev, ha, stack);
+	return dev_fill_forward_path(dev, ha, pkt->skb, stack);
 }
 
 struct nft_forward_info {
@@ -92,7 +93,9 @@ struct nft_forward_info {
 	enum flow_offload_xmit_type xmit_type;
 };
 
-static void nft_dev_path_info(const struct net_device_path_stack *stack,
+static void nft_dev_path_info(struct nf_flow_route *route,
+			      enum ip_conntrack_dir dir,
+			      const struct net_device_path_stack *stack,
 			      struct nft_forward_info *info,
 			      unsigned char *ha, struct nf_flowtable *flowtable)
 {
@@ -153,6 +156,10 @@ static void nft_dev_path_info(const struct net_device_path_stack *stack,
 			}
 			info->xmit_type = FLOW_OFFLOAD_XMIT_DIRECT;
 			break;
+		case DEV_PATH_TUNNEL:
+			route->tuple[dir].dst = path->tun.dst;
+			route->tuple[dir].xmit_type = FLOW_OFFLOAD_XMIT_NEIGH;
+			break;
 		default:
 			info->indev = NULL;
 			break;
@@ -186,6 +193,7 @@ static bool nft_flowtable_find_dev(const struct net_device *dev,
 }
 
 static void nft_dev_forward_path(struct nf_flow_route *route,
+				 const struct nft_pktinfo *pkt,
 				 const struct nf_conn *ct,
 				 enum ip_conntrack_dir dir,
 				 struct nft_flowtable *ft)
@@ -196,8 +204,8 @@ static void nft_dev_forward_path(struct nf_flow_route *route,
 	unsigned char ha[ETH_ALEN];
 	int i;
 
-	if (nft_dev_fill_forward_path(route, dst, ct, dir, ha, &stack) >= 0)
-		nft_dev_path_info(&stack, &info, ha, &ft->data);
+	if (nft_dev_fill_forward_path(route, dst, pkt, ct, dir, ha, &stack) >= 0)
+		nft_dev_path_info(route, dir, &stack, &info, ha, &ft->data);
 
 	if (!info.indev || !nft_flowtable_find_dev(info.indev, ft))
 		return;
@@ -263,11 +271,8 @@ static int nft_flow_route(const struct nft_pktinfo *pkt,
 	nft_default_forward_path(route, this_dst, dir);
 	nft_default_forward_path(route, other_dst, !dir);
 
-	if (route->tuple[dir].xmit_type	== FLOW_OFFLOAD_XMIT_NEIGH &&
-	    route->tuple[!dir].xmit_type == FLOW_OFFLOAD_XMIT_NEIGH) {
-		nft_dev_forward_path(route, ct, dir, ft);
-		nft_dev_forward_path(route, ct, !dir, ft);
-	}
+	nft_dev_forward_path(route, pkt, ct, dir, ft);
+	nft_dev_forward_path(route, pkt, ct, !dir, ft);
 
 	return 0;
 }
