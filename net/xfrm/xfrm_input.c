@@ -470,6 +470,7 @@ static int xfrm_input_loop(struct net *net, struct sk_buff *skb, struct xfrm_sta
 	int async = 0;
 	bool xfrm_gro = false;
 	bool crypto_done = false;
+	bool bulk = false;
 	struct xfrm_offload *xo = xfrm_offload(skb);
 
 	if (encap_type == -1) {
@@ -483,8 +484,10 @@ static int xfrm_input_loop(struct net *net, struct sk_buff *skb, struct xfrm_sta
 
 	/* encap_type < -1 indicates a GRO call. */
 	if (encap_type < -1) {
-		encap_type = 0;
 		family = x->outer_mode.family;
+		if (encap_type == -3)
+			bulk = true;
+		encap_type = 0;
 		goto lock;
 	}
 
@@ -561,6 +564,9 @@ lock:
 		XFRM_SKB_CB(skb)->seq.input.hi = seq_hi;
 
 		dev_hold(skb->dev);
+
+		if (bulk)
+			return 0;
 
 		if (crypto_done)
 			nexthdr = x->type_offload->input_tail(x, skb);
@@ -651,6 +657,7 @@ resume:
 		if (xo)
 			xfrm_gro = xo->flags & XFRM_GRO;
 
+		/* FIXME: Transport does not work?! */
 		err = -EAFNOSUPPORT;
 		rcu_read_lock();
 		afinfo = xfrm_state_afinfo_get_rcu(x->inner_mode.family);
@@ -683,9 +690,7 @@ int xfrm_input_list(struct sk_buff **skbp, int nexthdr, __be32 spi, int encap_ty
 	int err;
 	__be32 seq;
 	struct xfrm_state *x = NULL;
-	unsigned int family = AF_UNSPEC;
-	bool crypto_done = false;
-	struct xfrm_offload *xo = xfrm_offload(skb);
+	unsigned int family;
 	struct list_head head;
 
 	x = xfrm_input_state(skb);
@@ -697,73 +702,42 @@ int xfrm_input_list(struct sk_buff **skbp, int nexthdr, __be32 spi, int encap_ty
 			XFRM_INC_STATS(net,
 				       LINUX_MIB_XFRMINSTATEINVALID);
 
-		if (encap_type == -1)
-			dev_put(skb->dev);
 		goto drop;
 	}
 
 	family = x->outer_mode.family;
+	seq = XFRM_SKB_CB(skb)->seq.input.low;
 
-	/* An encap_type of -1 indicates async resumption. */
-	if (encap_type == -1) {
-		seq = XFRM_SKB_CB(skb)->seq.input.low;
-		goto loop;
-	}
-
-	seq = XFRM_SPI_SKB_CB(skb)->seq;
-
-	if (xo && (xo->flags & CRYPTO_DONE)) {
-		crypto_done = true;
-		family = XFRM_SPI_SKB_CB(skb)->family;
-
-		if (!(xo->status & CRYPTO_SUCCESS)) {
-			if (xo->status &
-			    (CRYPTO_TRANSPORT_AH_AUTH_FAILED |
-			     CRYPTO_TRANSPORT_ESP_AUTH_FAILED |
-			     CRYPTO_TUNNEL_AH_AUTH_FAILED |
-			     CRYPTO_TUNNEL_ESP_AUTH_FAILED)) {
-				xfrm_audit_state_icvfail(x, skb,
-							 x->type->proto);
-				x->stats.integrity_failed++;
-				XFRM_INC_STATS(net, LINUX_MIB_XFRMINSTATEPROTOERROR);
-				goto drop;
-			}
-
-			if (xo->status & CRYPTO_INVALID_PROTOCOL) {
-				XFRM_INC_STATS(net, LINUX_MIB_XFRMINSTATEPROTOERROR);
-				goto drop;
-			}
-
-			XFRM_INC_STATS(net, LINUX_MIB_XFRMINBUFFERERROR);
-			goto drop;
-		}
-
-		/* XXX: Do we need this here? */
-		if ((err = xfrm_parse_spi(skb, nexthdr, &spi, &seq)) != 0) {
-			XFRM_INC_STATS(net, LINUX_MIB_XFRMINHDRERROR);
-			goto drop;
-		}
-	}
-
-	family = XFRM_SPI_SKB_CB(skb)->family;
-
-loop:
 	INIT_LIST_HEAD(&head);
 	skb_list_walk_safe(skb, skb2, nskb) {
 
 		skb_mark_not_on_list(skb2);
 
-		err = xfrm_input_loop(net, skb2, x, nexthdr, spi, encap_type);
+		err = xfrm_input_loop(net, skb2, x, spi, nexthdr, encap_type);
 		if (err) {
-			if (err != -EINPROGRESS) {
-				skb2->next = nskb;
-				kfree_skb_list(skb2);
-				break;
-			}
+			xfrm_rcv_cb(skb2, family, x && x->type ? x->type->proto : nexthdr, -1);
+			kfree_skb(skb2);
 			continue;
 		}
 
 		list_add_tail(&skb2->list, &head);
+	}
+
+	x->type->input_list(x, &head);
+
+	if (list_empty(&head))
+		return 0;
+
+	list_for_each_entry_safe(skb, nskb, &head, list) {
+		nexthdr = XFRM_MODE_SKB_CB(skb)->protocol;
+
+		err = xfrm_input_loop(net, skb, x, spi, nexthdr, -1);
+		if (err) {
+			skb_list_del_init(skb);
+			xfrm_rcv_cb(skb, family, x && x->type ? x->type->proto : nexthdr, -1);
+			kfree_skb(skb);
+			continue;
+		}
 	}
 
 	/* XXX: Recursive call! */
@@ -771,7 +745,8 @@ loop:
 	return 0;
 
 drop:
-	xfrm_rcv_cb(skb, family, x && x->type ? x->type->proto : nexthdr, -1);
+	skb_list_walk_safe(skb, skb2, nskb)
+		xfrm_rcv_cb(skb2, family, x && x->type ? x->type->proto : nexthdr, -1);
 	kfree_skb_list(skb);
 	return 0;
 }

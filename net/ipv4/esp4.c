@@ -65,16 +65,53 @@ static void *esp_alloc_tmp(struct crypto_aead *aead, int nfrags, int extralen)
 	return kmalloc(len, GFP_ATOMIC);
 }
 
+static int esp_tmpvec_len(struct crypto_aead *aead, int nfrags, int extralen)
+{
+	unsigned int len;
+
+	len = extralen;
+
+	len += crypto_aead_ivsize(aead);
+
+	if (len) {
+		len += crypto_aead_alignmask(aead) &
+		       ~(crypto_tfm_ctx_alignment() - 1);
+		len = ALIGN(len, crypto_tfm_ctx_alignment());
+	}
+
+	len += sizeof(struct aead_request) + crypto_aead_reqsize(aead);
+	len = ALIGN(len, __alignof__(struct scatterlist));
+
+	len += sizeof(struct scatterlist) * nfrags;
+
+	return len;
+}
+
+static void *esp_alloc_tmpvec(int len)
+{
+	return kmalloc(gro_normal_batch * len, GFP_ATOMIC);
+}
+
+static void *esp_tmp(void *tmp, int len)
+{
+	return (u8 *)tmp + len;
+}
+
+static inline struct esp_info *esp_tmp_info(void *tmp)
+{
+	return PTR_ALIGN(tmp, __alignof__(struct esp_info));
+}
+
 static inline void *esp_tmp_extra(void *tmp)
 {
-	return PTR_ALIGN(tmp, __alignof__(struct esp_output_extra));
+	return PTR_ALIGN((u8 *)tmp + sizeof(struct esp_info), __alignof__(struct esp_output_extra));
 }
 
 static inline u8 *esp_tmp_iv(struct crypto_aead *aead, void *tmp, int extralen)
 {
 	return crypto_aead_ivsize(aead) ?
-	       PTR_ALIGN((u8 *)tmp + extralen,
-			 crypto_aead_alignmask(aead) + 1) : tmp + extralen;
+	       PTR_ALIGN((u8 *)tmp + sizeof(struct esp_info) + extralen,
+			 crypto_aead_alignmask(aead) + 1) : tmp + sizeof(struct esp_info) + extralen;
 }
 
 static inline struct aead_request *esp_tmp_req(struct crypto_aead *aead, u8 *iv)
@@ -651,6 +688,213 @@ error:
 }
 EXPORT_SYMBOL_GPL(esp_output_tail);
 
+static int esp_output_tail_list(struct xfrm_state *x, struct sk_buff *skb, struct esp_info *esp, void *tmp)
+{
+	u8 *iv;
+	int alen;
+//	void *tmp;
+	int ivlen;
+	int assoclen;
+	int extralen;
+	struct page *page;
+	struct ip_esp_hdr *esph;
+	struct crypto_aead *aead;
+	struct aead_request *req;
+	struct scatterlist *sg, *dsg;
+	struct esp_output_extra *extra;
+	int err = -ENOMEM;
+
+	assoclen = sizeof(struct ip_esp_hdr);
+	extralen = 0;
+
+	if (x->props.flags & XFRM_STATE_ESN) {
+		extralen += sizeof(*extra);
+		assoclen += sizeof(__be32);
+	}
+
+	aead = x->data;
+	alen = crypto_aead_authsize(aead);
+	ivlen = crypto_aead_ivsize(aead);
+
+//	tmp = esp_alloc_tmp(aead, esp->nfrags + 2, extralen);
+//	if (!tmp)
+//		goto error;
+
+	tmp = ESP_SKB_CB(skb)->tmp;
+
+	extra = esp_tmp_extra(tmp);
+	iv = esp_tmp_iv(aead, tmp, extralen);
+	req = esp_tmp_req(aead, iv);
+	sg = esp_req_sg(aead, req);
+
+	if (esp->inplace)
+		dsg = sg;
+	else
+		dsg = &sg[esp->nfrags];
+
+	esph = esp_output_set_extra(skb, x, esp->esph, extra);
+	esp->esph = esph;
+
+	sg_init_table(sg, esp->nfrags);
+	err = skb_to_sgvec(skb, sg,
+		           (unsigned char *)esph - skb->data,
+		           assoclen + ivlen + esp->clen + alen);
+	if (unlikely(err < 0))
+		goto error_free;
+
+	if (!esp->inplace) {
+		int allocsize;
+		struct page_frag *pfrag = &x->xfrag;
+
+		allocsize = ALIGN(skb->data_len, L1_CACHE_BYTES);
+
+		spin_lock_bh(&x->lock);
+		if (unlikely(!skb_page_frag_refill(allocsize, pfrag, GFP_ATOMIC))) {
+			spin_unlock_bh(&x->lock);
+			goto error_free;
+		}
+
+		skb_shinfo(skb)->nr_frags = 1;
+
+		page = pfrag->page;
+		get_page(page);
+		/* replace page frags in skb with new page */
+		__skb_fill_page_desc(skb, 0, page, pfrag->offset, skb->data_len);
+		pfrag->offset = pfrag->offset + allocsize;
+		spin_unlock_bh(&x->lock);
+
+		sg_init_table(dsg, skb_shinfo(skb)->nr_frags + 1);
+		err = skb_to_sgvec(skb, dsg,
+			           (unsigned char *)esph - skb->data,
+			           assoclen + ivlen + esp->clen + alen);
+		if (unlikely(err < 0))
+			goto error_free;
+	}
+
+	if ((x->props.flags & XFRM_STATE_ESN))
+		aead_request_set_callback(req, 0, esp_output_done_esn, skb);
+	else
+		aead_request_set_callback(req, 0, esp_output_done, skb);
+
+	aead_request_set_crypt(req, sg, dsg, ivlen + esp->clen, iv);
+	aead_request_set_ad(req, assoclen);
+
+	memset(iv, 0, ivlen);
+	memcpy(iv + ivlen - min(ivlen, 8), (u8 *)&esp->seqno + 8 - min(ivlen, 8),
+	       min(ivlen, 8));
+
+	err = crypto_aead_encrypt(req);
+
+	switch (err) {
+	case -EINPROGRESS:
+		goto error;
+
+	case -ENOSPC:
+		err = NET_XMIT_DROP;
+		break;
+
+	case 0:
+		if ((x->props.flags & XFRM_STATE_ESN))
+			esp_output_restore_header(skb);
+	}
+
+	if (sg != dsg)
+		esp_ssg_unref(x, tmp);
+
+	if (!err && x->encap && x->encap->encap_type == TCP_ENCAP_ESPINTCP)
+		err = esp_output_tail_tcp(x, skb);
+
+error_free:
+//	kfree(tmp);
+error:
+	return err;
+}
+
+static int esp_output_list(struct xfrm_state *x, struct list_head *head)
+{
+	int alen;
+	int blksize;
+	struct ip_esp_hdr *esph;
+	struct crypto_aead *aead;
+	struct esp_info *esp;
+	int len;
+	struct sk_buff *skb, *nskb;
+	void *tmpvec;
+	void *tmp;
+	int i = 0, tmplen;
+	int ret;
+
+	len = sizeof(struct esp_info);
+
+	if (x->props.flags & XFRM_STATE_ESN)
+		len += sizeof(struct esp_output_extra);
+
+	tmplen = esp_tmpvec_len(x->data, /*esp->nfrags*/ 1 + 2, len);
+	tmpvec = esp_alloc_tmpvec(tmplen);
+	if (!tmpvec)
+		return -ENOMEM;
+
+	list_for_each_entry_safe(skb, nskb, head, list) {
+
+		tmp = esp_tmp(tmpvec, tmplen * i);
+		esp  = esp_tmp_info(tmp);
+		ESP_SKB_CB(skb)->tmp = tmp;
+
+		esp->inplace = true;
+
+		esp->proto = *skb_mac_header(skb);
+		*skb_mac_header(skb) = IPPROTO_ESP;
+
+		/* skb is pure payload to encrypt */
+
+		aead = x->data;
+		alen = crypto_aead_authsize(aead);
+
+		esp->tfclen = 0;
+		if (x->tfcpad) {
+			struct xfrm_dst *dst = (struct xfrm_dst *)skb_dst(skb);
+			u32 padto;
+
+			padto = min(x->tfcpad, xfrm_state_mtu(x, dst->child_mtu_cached));
+			if (skb->len < padto)
+				esp->tfclen = padto - skb->len;
+		}
+		blksize = ALIGN(crypto_aead_blocksize(aead), 4);
+		esp->clen = ALIGN(skb->len + 2 + esp->tfclen, blksize);
+		esp->plen = esp->clen - skb->len - esp->tfclen;
+		esp->tailen = esp->tfclen + esp->plen + alen;
+
+		esp->esph = ip_esp_hdr(skb);
+
+		esp->nfrags = esp_output_head(x, skb, esp);
+		if (esp->nfrags < 0) {
+			skb_list_del_init(skb);
+			/* XXX: Error handling */
+			continue;
+
+//			return esp->nfrags;
+		}
+
+		esph = esp->esph;
+		esph->spi = x->id.spi;
+
+		esph->seq_no = htonl(XFRM_SKB_CB(skb)->seq.output.low);
+		esp->seqno = cpu_to_be64(XFRM_SKB_CB(skb)->seq.output.low +
+					 ((u64)XFRM_SKB_CB(skb)->seq.output.hi << 32));
+
+		skb_push(skb, -skb_network_offset(skb));
+
+		ret = esp_output_tail_list(x, skb, esp, tmp);
+
+		i++;
+	}
+
+	kfree(tmpvec);
+
+	return 0;
+}
+
+
 static int esp_output(struct xfrm_state *x, struct sk_buff *skb)
 {
 	int alen;
@@ -701,9 +945,8 @@ static int esp_output(struct xfrm_state *x, struct sk_buff *skb)
 	return esp_output_tail(x, skb, &esp);
 }
 
-static inline int esp_remove_trailer(struct sk_buff *skb)
+static inline int __esp_remove_trailer(struct sk_buff *skb, struct xfrm_state *x)
 {
-	struct xfrm_state *x = xfrm_input_state(skb);
 	struct crypto_aead *aead = x->data;
 	int alen, hlen, elen;
 	int padlen, trimlen;
@@ -740,22 +983,15 @@ out:
 	return ret;
 }
 
-int esp_input_done2(struct sk_buff *skb, int err)
+static int esp_input_done_direct(struct sk_buff *skb, struct xfrm_state *x)
 {
 	const struct iphdr *iph;
-	struct xfrm_state *x = xfrm_input_state(skb);
-	struct xfrm_offload *xo = xfrm_offload(skb);
 	struct crypto_aead *aead = x->data;
 	int hlen = sizeof(struct ip_esp_hdr) + crypto_aead_ivsize(aead);
 	int ihl;
+	int err;
 
-	if (!xo || !(xo->flags & CRYPTO_DONE))
-		kfree(ESP_SKB_CB(skb)->tmp);
-
-	if (unlikely(err))
-		goto out;
-
-	err = esp_remove_trailer(skb);
+	err = __esp_remove_trailer(skb, x);
 	if (unlikely(err < 0))
 		goto out;
 
@@ -828,6 +1064,20 @@ int esp_input_done2(struct sk_buff *skb, int err)
 out:
 	return err;
 }
+
+int esp_input_done2(struct sk_buff *skb, int err)
+{
+	struct xfrm_state *x = xfrm_input_state(skb);
+	struct xfrm_offload *xo = xfrm_offload(skb);
+
+	if (!xo || !(xo->flags & CRYPTO_DONE))
+		kfree(ESP_SKB_CB(skb)->tmp);
+
+	if (unlikely(err))
+		return err;
+
+	return esp_input_done_direct(skb, x);
+}
 EXPORT_SYMBOL_GPL(esp_input_done2);
 
 static void esp_input_done(struct crypto_async_request *base, int err)
@@ -843,9 +1093,8 @@ static void esp_input_restore_header(struct sk_buff *skb)
 	__skb_pull(skb, 4);
 }
 
-static void esp_input_set_header(struct sk_buff *skb, __be32 *seqhi)
+static void esp_input_set_header(struct sk_buff *skb, struct xfrm_state *x, __be32 *seqhi)
 {
-	struct xfrm_state *x = xfrm_input_state(skb);
 	struct ip_esp_hdr *esph;
 
 	/* For ESN we move the header forward by 4 bytes to
@@ -934,7 +1183,7 @@ skip_cow:
 	req = esp_tmp_req(aead, iv);
 	sg = esp_req_sg(aead, req);
 
-	esp_input_set_header(skb, seqhi);
+	esp_input_set_header(skb, x, seqhi);
 
 	sg_init_table(sg, nfrags);
 	err = skb_to_sgvec(skb, sg, 0, skb->len);
@@ -962,6 +1211,148 @@ skip_cow:
 
 	err = esp_input_done2(skb, err);
 
+out:
+	return err;
+}
+
+static int esp_input_list(struct xfrm_state *x, struct list_head *head)
+{
+	struct crypto_aead *aead = x->data;
+	struct sk_buff *skb, *n;
+	struct aead_request *req;
+	struct sk_buff *trailer;
+	int ivlen = crypto_aead_ivsize(aead);
+	bool slowpath = false;
+	int elen;
+	int nfrags = 17; /*XXX*/
+	int assoclen;
+	int seqhilen;
+	__be32 *seqhi;
+	void *tmp;
+	u8 *iv;
+	struct scatterlist *sg;
+	int err = -ENOMEM;
+
+	if (list_empty(head))
+		return 0;
+
+	assoclen = sizeof(struct ip_esp_hdr);
+	seqhilen = 0;
+
+	if (x->props.flags & XFRM_STATE_ESN) {
+		seqhilen += sizeof(__be32);
+		assoclen += seqhilen;
+	}
+
+	tmp = esp_alloc_tmp(aead, nfrags, seqhilen);
+	if (!tmp) {
+		list_for_each_entry(skb, head, list)
+			XFRM_MODE_SKB_CB(skb)->protocol = err;
+		goto out;
+	}
+
+	list_for_each_entry_safe(skb, n, head, list) {
+
+		err = -EINVAL;
+
+		if (slowpath) {
+			if (!secpath_set(skb)) {
+				XFRM_MODE_SKB_CB(skb)->protocol = -ENOMEM;
+				continue;
+			}
+
+			skb_list_del_init(skb);
+			err = esp_input(x, skb);
+			/* Theory of operation: Bottomhalves are off and
+			 * async resumption happens at the same cpu, so
+			 * async resumption can't start until we enable
+			 * bottomhalves again. This means it is save to
+			 * modify the skb after esp_input returned
+			 * -EINPROGRESS. OK?
+			 */
+			XFRM_MODE_SKB_CB(skb)->protocol = err;
+			continue;
+		}
+
+		if (!pskb_may_pull(skb, sizeof(struct ip_esp_hdr) + ivlen)) {
+			XFRM_MODE_SKB_CB(skb)->protocol = err;
+			continue;
+		}
+
+		elen = skb->len - sizeof(struct ip_esp_hdr) - ivlen;
+		if (elen <= 0) {
+			XFRM_MODE_SKB_CB(skb)->protocol = err;
+			continue;
+		}
+
+		if (!skb_cloned(skb)) {
+			if (!skb_is_nonlinear(skb)) {
+				nfrags = 1;
+
+				goto skip_cow;
+			} else if (!skb_has_frag_list(skb)) {
+				nfrags = skb_shinfo(skb)->nr_frags;
+				nfrags++;
+
+				goto skip_cow;
+			}
+		}
+
+		err = skb_cow_data(skb, 0, &trailer);
+		if (err < 0) {
+			XFRM_MODE_SKB_CB(skb)->protocol = err;
+			continue;
+		}
+
+		nfrags = err;
+
+skip_cow:
+		ESP_SKB_CB(skb)->tmp = tmp;
+		seqhi = esp_tmp_extra(tmp);
+		iv = esp_tmp_iv(aead, tmp, seqhilen);
+		req = esp_tmp_req(aead, iv);
+		sg = esp_req_sg(aead, req);
+
+		esp_input_set_header(skb, x, seqhi);
+
+		sg_init_table(sg, nfrags);
+		err = skb_to_sgvec(skb, sg, 0, skb->len);
+		if (unlikely(err < 0)) {
+			XFRM_MODE_SKB_CB(skb)->protocol = err;
+			continue;
+		}
+
+		skb->ip_summed = CHECKSUM_NONE;
+
+		if ((x->props.flags & XFRM_STATE_ESN))
+			aead_request_set_callback(req, 0, esp_input_done_esn, skb);
+		else
+			aead_request_set_callback(req, 0, esp_input_done, skb);
+
+		aead_request_set_crypt(req, sg, sg, elen + ivlen, iv);
+		aead_request_set_ad(req, assoclen);
+
+		err = crypto_aead_decrypt(req);
+		if (err == -EINPROGRESS) {
+			if (!secpath_set(skb))
+				XFRM_MODE_SKB_CB(skb)->protocol = -ENOMEM;
+
+			skb_list_del_init(skb);
+			slowpath = true;
+			continue;
+		} else if (err < 0) {
+			XFRM_MODE_SKB_CB(skb)->protocol = err;
+			continue;
+		}
+
+		if ((x->props.flags & XFRM_STATE_ESN))
+			esp_input_restore_header(skb);
+
+		err = esp_input_done_direct(skb, x);
+		XFRM_MODE_SKB_CB(skb)->protocol = err;
+	}
+
+	kfree(tmp);
 out:
 	return err;
 }
@@ -1211,7 +1602,9 @@ static const struct xfrm_type esp_type =
 	.init_state	= esp_init_state,
 	.destructor	= esp_destroy,
 	.input		= esp_input,
+	.input_list	= esp_input_list,
 	.output		= esp_output,
+	.output_list	= esp_output_list,
 };
 
 static struct xfrm4_protocol esp4_protocol = {

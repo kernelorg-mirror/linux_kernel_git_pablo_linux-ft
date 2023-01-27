@@ -788,6 +788,8 @@ struct sk_buff *xfrm_output_list(struct sk_buff *skb)
 {
 	struct net *net = dev_net(skb_dst(skb)->dev);
 	struct xfrm_state *x = skb_dst(skb)->xfrm;
+	struct sk_buff *head_skb = NULL, *nskb;
+	struct list_head head;
 	struct dst_entry *dst;
 	struct sk_buff *iter;
 	struct iphdr *iph;
@@ -804,22 +806,18 @@ struct sk_buff *xfrm_output_list(struct sk_buff *skb)
 		goto error;
 	}
 
-	iter = skb;
-
-	while (iter) {
-		struct sk_buff *next;
-
-		next =iter->next;
-		iter->next = NULL;
+	INIT_LIST_HEAD(&head);
+	skb_list_walk_safe(skb, iter, nskb) {
+		skb_mark_not_on_list(iter);
 
 		switch (x->outer_mode.family) {
 		case AF_INET:
-			memset(IPCB(iter), 0, sizeof(*IPCB(iter)));
-			IPCB(iter)->flags |= IPSKB_XFRM_TRANSFORMED;
+//			memset(IPCB(iter), 0, sizeof(*IPCB(iter)));
+			IPCB(iter)->flags = IPSKB_XFRM_TRANSFORMED;
 			break;
 		case AF_INET6:
-			memset(IP6CB(iter), 0, sizeof(*IP6CB(iter)));
-			IP6CB(iter)->flags |= IP6SKB_XFRM_TRANSFORMED;
+//			memset(IP6CB(iter), 0, sizeof(*IP6CB(iter)));
+			IP6CB(iter)->flags = IP6SKB_XFRM_TRANSFORMED;
 			break;
 		}
 
@@ -849,10 +847,7 @@ struct sk_buff *xfrm_output_list(struct sk_buff *skb)
 			err = skb_checksum_help(iter);
 			if (err) {
 				XFRM_INC_STATS(net, LINUX_MIB_XFRMOUTERROR);
-				if (iter == skb)
-					skb = next;
 				kfree_skb(iter);
-				iter = next;
 				continue;
 			}
 		}
@@ -860,10 +855,7 @@ struct sk_buff *xfrm_output_list(struct sk_buff *skb)
 		err = xfrm_skb_check_space(iter);
 		if (err) {
 			XFRM_INC_STATS(net, LINUX_MIB_XFRMOUTERROR);
-			if (iter == skb)
-				skb = next;
 			kfree_skb(iter);
-			iter = next;
 			continue;
 		}
 
@@ -872,10 +864,7 @@ struct sk_buff *xfrm_output_list(struct sk_buff *skb)
 		err = xfrm_outer_mode_output(x, iter);
 		if (err) {
 			XFRM_INC_STATS(net, LINUX_MIB_XFRMOUTSTATEMODEERROR);
-			if (iter == skb)
-				skb = next;
 			kfree_skb(iter);
-			iter = next;
 			continue;
 		}
 
@@ -883,10 +872,7 @@ struct sk_buff *xfrm_output_list(struct sk_buff *skb)
 		err = xfrm_replay_overflow(x, iter);
 		if (err) {
 			XFRM_INC_STATS(net, LINUX_MIB_XFRMOUTSTATESEQERROR);
-			if (iter == skb)
-				skb = next;
 			kfree_skb(iter);
-			iter = next;
 			spin_unlock(&x->lock);
 			continue;
 		}
@@ -896,54 +882,71 @@ struct sk_buff *xfrm_output_list(struct sk_buff *skb)
 
 		spin_unlock(&x->lock);
 
-		skb_dst_force(iter);
-		if (!skb_dst(iter)) {
-			XFRM_INC_STATS(net, LINUX_MIB_XFRMOUTERROR);
-			if (iter == skb)
-				skb = next;
-			kfree_skb(iter);
-			iter = next;
-			continue;
-		}
+//		skb_dst_force(iter);
+//		if (!skb_dst(iter)) {
+//			XFRM_INC_STATS(net, LINUX_MIB_XFRMOUTERROR);
+//			kfree_skb(iter);
+//			continue;
+//		}
 
 		/* Inner headers are invalid now. */
-		skb->encapsulation = 0;
+		iter->encapsulation = 0;
 
-		err = x->type->output(x, iter);
-		if (err == -EINPROGRESS) {
-			if (iter == skb)
-				skb = next;
-			iter = next;
+		list_add_tail(&iter->list, &head);
+	}
+
+	err = x->type->output_list(x, &head);
+/*
+	INIT_LIST_HEAD(&head2);
+	list_for_each_entry_safe(skb, nskb, &head, list) {
+		skb_list_del_init(skb);
+		err = x->type->output(x, skb);
+		if (err == -EINPROGRESS)
+			continue;
+
+		if (err) {
+			XFRM_INC_STATS(net, LINUX_MIB_XFRMOUTSTATEPROTOERROR);
+			kfree_skb(skb);
 			continue;
 		}
 
-		dst = skb_dst_pop_noref(iter);
+		list_add_tail(&skb->list, &head2);
+	}
+*/
+
+	iter = NULL;
+
+	list_for_each_entry_safe(skb, nskb, &head, list) {
+
+		skb_list_del_init(skb);
+
+		dst = skb_dst_pop_noref(skb);
 		if (!dst) {
 			XFRM_INC_STATS(net, LINUX_MIB_XFRMOUTERROR);
-			if (iter == skb)
-				skb = next;
-			kfree_skb(iter);
-			iter = next;
+			kfree_skb(skb);
 			continue;
 		}
-		skb_dst_set_noref(iter, dst);
+		skb_dst_set_noref(skb, dst);
 
 		switch (x->outer_mode.family) {
 		case AF_INET:
-			iph = ip_hdr(iter);
-			iph->tot_len = htons(iter->len);
+			iph = ip_hdr(skb);
+			iph->tot_len = htons(skb->len);
 			ip_send_check(iph);
 			break;
 		case AF_INET6:
 			break;
 		}
 
+		if (!head_skb)
+			head_skb = skb;
+		else
+			iter->next = skb;
 
-		iter->next = next;
-		iter = next;
+		iter = skb;
 	}
 
-	return skb;
+	return head_skb;
 error:
 	kfree_skb_list(skb);
 	return NULL;
