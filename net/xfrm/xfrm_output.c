@@ -792,6 +792,7 @@ struct sk_buff *xfrm_output_list(struct sk_buff *skb)
 	struct list_head head;
 	struct dst_entry *dst;
 	struct sk_buff *iter;
+	struct ipv6hdr *ip6h;
 	struct iphdr *iph;
 	int err;
 
@@ -809,35 +810,6 @@ struct sk_buff *xfrm_output_list(struct sk_buff *skb)
 	INIT_LIST_HEAD(&head);
 	skb_list_walk_safe(skb, iter, nskb) {
 		skb_mark_not_on_list(iter);
-
-		switch (x->outer_mode.family) {
-		case AF_INET:
-//			memset(IPCB(iter), 0, sizeof(*IPCB(iter)));
-			IPCB(iter)->flags = IPSKB_XFRM_TRANSFORMED;
-			break;
-		case AF_INET6:
-//			memset(IP6CB(iter), 0, sizeof(*IP6CB(iter)));
-			IP6CB(iter)->flags = IP6SKB_XFRM_TRANSFORMED;
-			break;
-		}
-
-		/*
-		secpath_reset(iter);
-
-		sp = secpath_set(iter);
-		if (!sp) {
-			XFRM_INC_STATS(net, LINUX_MIB_XFRMOUTERROR);
-			if (iter == skb)
-				skb = next;
-			kfree_skb(iter);
-			iter = next;
-			continue;
-		}
-
-		sp->olen++;
-		sp->xvec[sp->len++] = x;
-		xfrm_state_hold(x);
-		*/
 
 		xfrm_get_inner_ipproto(iter, x);
 		iter->encapsulation = 1;
@@ -882,43 +854,45 @@ struct sk_buff *xfrm_output_list(struct sk_buff *skb)
 
 		spin_unlock(&x->lock);
 
-//		skb_dst_force(iter);
-//		if (!skb_dst(iter)) {
-//			XFRM_INC_STATS(net, LINUX_MIB_XFRMOUTERROR);
-//			kfree_skb(iter);
-//			continue;
-//		}
-
 		/* Inner headers are invalid now. */
 		iter->encapsulation = 0;
+
+		XFRM_BULK_SKB_CB(iter)->err = 0;
 
 		list_add_tail(&iter->list, &head);
 	}
 
 	err = x->type->output_list(x, &head);
-/*
-	INIT_LIST_HEAD(&head2);
-	list_for_each_entry_safe(skb, nskb, &head, list) {
-		skb_list_del_init(skb);
-		err = x->type->output(x, skb);
-		if (err == -EINPROGRESS)
-			continue;
-
-		if (err) {
-			XFRM_INC_STATS(net, LINUX_MIB_XFRMOUTSTATEPROTOERROR);
-			kfree_skb(skb);
-			continue;
-		}
-
-		list_add_tail(&skb->list, &head2);
-	}
-*/
 
 	iter = NULL;
 
 	list_for_each_entry_safe(skb, nskb, &head, list) {
 
 		skb_list_del_init(skb);
+
+		if (XFRM_BULK_SKB_CB(skb)->err) {
+			if (XFRM_BULK_SKB_CB(skb)->err == -EINPROGRESS) {
+
+				/* Theory of operation: This is exclusively used in
+				 * the forwarding path, so BHs are off and async crypto
+				 * resumption can't happen before BHs are enabled. This
+				 * means that we can still modify the skb. OK?
+				 */
+				skb_dst_force(skb);
+				if (!skb_dst(skb)) {
+					/* skb leak here? */
+					XFRM_BULK_SKB_CB(skb)->err = -ENOMEM;
+					continue;
+				}
+
+				XFRM_BULK_SKB_CB(skb)->err = 0;
+				continue;
+			} else {
+				XFRM_INC_STATS(net, LINUX_MIB_XFRMOUTERROR);
+				kfree_skb(skb);
+				continue;
+			}
+		}
 
 		dst = skb_dst_pop_noref(skb);
 		if (!dst) {
@@ -933,8 +907,12 @@ struct sk_buff *xfrm_output_list(struct sk_buff *skb)
 			iph = ip_hdr(skb);
 			iph->tot_len = htons(skb->len);
 			ip_send_check(iph);
+			IPCB(skb)->flags = IPSKB_XFRM_TRANSFORMED;
 			break;
 		case AF_INET6:
+			ip6h = ipv6_hdr(skb);
+			ip6h->payload_len = htons(skb->len - sizeof(struct ipv6hdr));
+			IP6CB(skb)->flags = IP6SKB_XFRM_TRANSFORMED;
 			break;
 		}
 
