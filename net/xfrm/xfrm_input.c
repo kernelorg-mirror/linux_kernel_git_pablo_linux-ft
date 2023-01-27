@@ -457,128 +457,52 @@ static int xfrm_inner_mode_input(struct xfrm_state *x,
 	return -EOPNOTSUPP;
 }
 
-int xfrm_input(struct sk_buff *skb, int nexthdr, __be32 spi, int encap_type)
+static int xfrm_input_loop(struct net *net, struct sk_buff *skb, struct xfrm_state *x, __be32 spi, int nexthdr, int encap_type)
 {
 	const struct xfrm_state_afinfo *afinfo;
-	struct net *net = dev_net(skb->dev);
 	const struct xfrm_mode *inner_mode;
-	int err;
+	xfrm_address_t *daddr;
+	unsigned int family;
+	struct sec_path *sp;
 	__be32 seq;
 	__be32 seq_hi;
-	struct xfrm_state *x = NULL;
-	xfrm_address_t *daddr;
-	u32 mark = skb->mark;
-	unsigned int family = AF_UNSPEC;
-	int decaps = 0;
+	int err = 0;
 	int async = 0;
 	bool xfrm_gro = false;
 	bool crypto_done = false;
 	struct xfrm_offload *xo = xfrm_offload(skb);
-	struct sec_path *sp;
 
-	if (encap_type < 0) {
-		x = xfrm_input_state(skb);
-
-		if (unlikely(x->km.state != XFRM_STATE_VALID)) {
-			if (x->km.state == XFRM_STATE_ACQ)
-				XFRM_INC_STATS(net, LINUX_MIB_XFRMACQUIREERROR);
-			else
-				XFRM_INC_STATS(net,
-					       LINUX_MIB_XFRMINSTATEINVALID);
-
-			if (encap_type == -1)
-				dev_put(skb->dev);
-			goto drop;
-		}
-
+	if (encap_type == -1) {
+		async = 1;
 		family = x->outer_mode.family;
+		seq = XFRM_SKB_CB(skb)->seq.input.low;
+		goto resume;
+	}
 
-		/* An encap_type of -1 indicates async resumption. */
-		if (encap_type == -1) {
-			async = 1;
-			seq = XFRM_SKB_CB(skb)->seq.input.low;
-			goto resume;
-		}
+	seq = XFRM_SPI_SKB_CB(skb)->seq;
 
-		/* encap_type < -1 indicates a GRO call. */
+	/* encap_type < -1 indicates a GRO call. */
+	if (encap_type < -1) {
 		encap_type = 0;
-		seq = XFRM_SPI_SKB_CB(skb)->seq;
-
-		if (xo && (xo->flags & CRYPTO_DONE)) {
-			crypto_done = true;
-			family = XFRM_SPI_SKB_CB(skb)->family;
-
-			if (!(xo->status & CRYPTO_SUCCESS)) {
-				if (xo->status &
-				    (CRYPTO_TRANSPORT_AH_AUTH_FAILED |
-				     CRYPTO_TRANSPORT_ESP_AUTH_FAILED |
-				     CRYPTO_TUNNEL_AH_AUTH_FAILED |
-				     CRYPTO_TUNNEL_ESP_AUTH_FAILED)) {
-
-					xfrm_audit_state_icvfail(x, skb,
-								 x->type->proto);
-					x->stats.integrity_failed++;
-					XFRM_INC_STATS(net, LINUX_MIB_XFRMINSTATEPROTOERROR);
-					goto drop;
-				}
-
-				if (xo->status & CRYPTO_INVALID_PROTOCOL) {
-					XFRM_INC_STATS(net, LINUX_MIB_XFRMINSTATEPROTOERROR);
-					goto drop;
-				}
-
-				XFRM_INC_STATS(net, LINUX_MIB_XFRMINBUFFERERROR);
-				goto drop;
-			}
-
-			if (xfrm_parse_spi(skb, nexthdr, &spi, &seq)) {
-				XFRM_INC_STATS(net, LINUX_MIB_XFRMINHDRERROR);
-				goto drop;
-			}
-		}
-
+		family = x->outer_mode.family;
 		goto lock;
-	}
-
-	family = XFRM_SPI_SKB_CB(skb)->family;
-
-	/* if tunnel is present override skb->mark value with tunnel i_key */
-	switch (family) {
-	case AF_INET:
-		if (XFRM_TUNNEL_SKB_CB(skb)->tunnel.ip4)
-			mark = be32_to_cpu(XFRM_TUNNEL_SKB_CB(skb)->tunnel.ip4->parms.i_key);
-		break;
-	case AF_INET6:
-		if (XFRM_TUNNEL_SKB_CB(skb)->tunnel.ip6)
-			mark = be32_to_cpu(XFRM_TUNNEL_SKB_CB(skb)->tunnel.ip6->parms.i_key);
-		break;
-	}
-
-	sp = secpath_set(skb);
-	if (!sp) {
-		XFRM_INC_STATS(net, LINUX_MIB_XFRMINERROR);
-		goto drop;
-	}
-
-	seq = 0;
-	if (!spi && xfrm_parse_spi(skb, nexthdr, &spi, &seq)) {
-		secpath_reset(skb);
-		XFRM_INC_STATS(net, LINUX_MIB_XFRMINHDRERROR);
-		goto drop;
 	}
 
 	daddr = (xfrm_address_t *)(skb_network_header(skb) +
 				   XFRM_SPI_SKB_CB(skb)->daddroff);
+
+	family = XFRM_SPI_SKB_CB(skb)->family;
+
 	do {
 		sp = skb_sec_path(skb);
 
-		if (sp->len == XFRM_MAX_DEPTH) {
+		if (sp && sp->len == XFRM_MAX_DEPTH) {
 			secpath_reset(skb);
 			XFRM_INC_STATS(net, LINUX_MIB_XFRMINBUFFERERROR);
 			goto drop;
 		}
 
-		x = xfrm_state_lookup(net, mark, daddr, spi, nexthdr, family);
+		x = xfrm_state_lookup(net, skb->mark, daddr, spi, nexthdr, family);
 		if (x == NULL) {
 			secpath_reset(skb);
 			XFRM_INC_STATS(net, LINUX_MIB_XFRMINNOSTATES);
@@ -588,7 +512,8 @@ int xfrm_input(struct sk_buff *skb, int nexthdr, __be32 spi, int encap_type)
 
 		skb->mark = xfrm_smark_get(skb->mark, x);
 
-		sp->xvec[sp->len++] = x;
+		if (sp)
+			sp->xvec[sp->len++] = x;
 
 		skb_dst_force(skb);
 		if (!skb_dst(skb)) {
@@ -643,7 +568,7 @@ lock:
 			nexthdr = x->type->input(x, skb);
 
 		if (nexthdr == -EINPROGRESS)
-			return 0;
+			return nexthdr;
 resume:
 		dev_put(skb->dev);
 
@@ -691,10 +616,8 @@ resume:
 			goto drop;
 		}
 
-		if (x->outer_mode.flags & XFRM_MODE_FLAG_TUNNEL) {
-			decaps = 1;
+		if (x->outer_mode.flags & XFRM_MODE_FLAG_TUNNEL)
 			break;
-		}
 
 		/*
 		 * We need the inner address.  However, we only get here for
@@ -703,8 +626,7 @@ resume:
 		daddr = &x->id.daddr;
 		family = x->outer_mode.family;
 
-		err = xfrm_parse_spi(skb, nexthdr, &spi, &seq);
-		if (err < 0) {
+		if (xfrm_parse_spi(skb, nexthdr, &spi, &seq)) {
 			XFRM_INC_STATS(net, LINUX_MIB_XFRMINHDRERROR);
 			goto drop;
 		}
@@ -717,13 +639,12 @@ resume:
 
 	nf_reset_ct(skb);
 
-	if (decaps) {
+	if (x->outer_mode.flags & XFRM_MODE_FLAG_TUNNEL) {
 		sp = skb_sec_path(skb);
 		if (sp)
 			sp->olen = 0;
 		if (skb_valid_dst(skb))
 			skb_dst_drop(skb);
-		gro_cells_receive(&gro_cells, skb);
 		return 0;
 	} else {
 		xo = xfrm_offload(skb);
@@ -742,15 +663,233 @@ resume:
 				sp->olen = 0;
 			if (skb_valid_dst(skb))
 				skb_dst_drop(skb);
-			gro_cells_receive(&gro_cells, skb);
 			return err;
 		}
-
-		return err;
 	}
+
+	return 0;
 
 drop_unlock:
 	spin_unlock(&x->lock);
+drop:
+	return -EINVAL;
+}
+
+int xfrm_input_list(struct sk_buff **skbp, int nexthdr, __be32 spi, int encap_type)
+{
+	struct sk_buff *skb2, *nskb;
+	struct sk_buff *skb = *skbp;
+	struct net *net = dev_net(skb->dev);
+	int err;
+	__be32 seq;
+	struct xfrm_state *x = NULL;
+	unsigned int family = AF_UNSPEC;
+	bool crypto_done = false;
+	struct xfrm_offload *xo = xfrm_offload(skb);
+	struct list_head head;
+
+	x = xfrm_input_state(skb);
+
+	if (unlikely(x->km.state != XFRM_STATE_VALID)) {
+		if (x->km.state == XFRM_STATE_ACQ)
+			XFRM_INC_STATS(net, LINUX_MIB_XFRMACQUIREERROR);
+		else
+			XFRM_INC_STATS(net,
+				       LINUX_MIB_XFRMINSTATEINVALID);
+
+		if (encap_type == -1)
+			dev_put(skb->dev);
+		goto drop;
+	}
+
+	family = x->outer_mode.family;
+
+	/* An encap_type of -1 indicates async resumption. */
+	if (encap_type == -1) {
+		seq = XFRM_SKB_CB(skb)->seq.input.low;
+		goto loop;
+	}
+
+	seq = XFRM_SPI_SKB_CB(skb)->seq;
+
+	if (xo && (xo->flags & CRYPTO_DONE)) {
+		crypto_done = true;
+		family = XFRM_SPI_SKB_CB(skb)->family;
+
+		if (!(xo->status & CRYPTO_SUCCESS)) {
+			if (xo->status &
+			    (CRYPTO_TRANSPORT_AH_AUTH_FAILED |
+			     CRYPTO_TRANSPORT_ESP_AUTH_FAILED |
+			     CRYPTO_TUNNEL_AH_AUTH_FAILED |
+			     CRYPTO_TUNNEL_ESP_AUTH_FAILED)) {
+				xfrm_audit_state_icvfail(x, skb,
+							 x->type->proto);
+				x->stats.integrity_failed++;
+				XFRM_INC_STATS(net, LINUX_MIB_XFRMINSTATEPROTOERROR);
+				goto drop;
+			}
+
+			if (xo->status & CRYPTO_INVALID_PROTOCOL) {
+				XFRM_INC_STATS(net, LINUX_MIB_XFRMINSTATEPROTOERROR);
+				goto drop;
+			}
+
+			XFRM_INC_STATS(net, LINUX_MIB_XFRMINBUFFERERROR);
+			goto drop;
+		}
+
+		/* XXX: Do we need this here? */
+		if ((err = xfrm_parse_spi(skb, nexthdr, &spi, &seq)) != 0) {
+			XFRM_INC_STATS(net, LINUX_MIB_XFRMINHDRERROR);
+			goto drop;
+		}
+	}
+
+	family = XFRM_SPI_SKB_CB(skb)->family;
+
+loop:
+	INIT_LIST_HEAD(&head);
+	skb_list_walk_safe(skb, skb2, nskb) {
+
+		skb_mark_not_on_list(skb2);
+
+		err = xfrm_input_loop(net, skb2, x, nexthdr, spi, encap_type);
+		if (err) {
+			if (err != -EINPROGRESS) {
+				skb2->next = nskb;
+				kfree_skb_list(skb2);
+				break;
+			}
+			continue;
+		}
+
+		list_add_tail(&skb2->list, &head);
+	}
+
+	/* XXX: Recursive call! */
+	netif_receive_skb_list(&head);
+	return 0;
+
+drop:
+	xfrm_rcv_cb(skb, family, x && x->type ? x->type->proto : nexthdr, -1);
+	kfree_skb_list(skb);
+	return 0;
+}
+EXPORT_SYMBOL(xfrm_input_list);
+
+int xfrm_input(struct sk_buff *skb, int nexthdr, __be32 spi, int encap_type)
+{
+	struct net *net = dev_net(skb->dev);
+	int err;
+	__be32 seq;
+	struct xfrm_state *x = NULL;
+	u32 mark = skb->mark;
+	unsigned int family = AF_UNSPEC;
+	int async = 0;
+	bool crypto_done = false;
+	struct xfrm_offload *xo = xfrm_offload(skb);
+	struct sec_path *sp;
+
+	if (encap_type < 0) {
+		x = xfrm_input_state(skb);
+
+		if (unlikely(x->km.state != XFRM_STATE_VALID)) {
+			if (x->km.state == XFRM_STATE_ACQ)
+				XFRM_INC_STATS(net, LINUX_MIB_XFRMACQUIREERROR);
+			else
+				XFRM_INC_STATS(net,
+					       LINUX_MIB_XFRMINSTATEINVALID);
+
+			if (encap_type == -1)
+				dev_put(skb->dev);
+			goto drop;
+		}
+
+		family = x->outer_mode.family;
+
+		/* An encap_type of -1 indicates async resumption. */
+		if (encap_type == -1) {
+			async = 1;
+			seq = XFRM_SKB_CB(skb)->seq.input.low;
+			goto loop;
+		}
+
+		seq = XFRM_SPI_SKB_CB(skb)->seq;
+
+		if (xo && (xo->flags & CRYPTO_DONE)) {
+			crypto_done = true;
+			family = XFRM_SPI_SKB_CB(skb)->family;
+
+			if (!(xo->status & CRYPTO_SUCCESS)) {
+				if (xo->status &
+				    (CRYPTO_TRANSPORT_AH_AUTH_FAILED |
+				     CRYPTO_TRANSPORT_ESP_AUTH_FAILED |
+				     CRYPTO_TUNNEL_AH_AUTH_FAILED |
+				     CRYPTO_TUNNEL_ESP_AUTH_FAILED)) {
+
+					xfrm_audit_state_icvfail(x, skb,
+								 x->type->proto);
+					x->stats.integrity_failed++;
+					XFRM_INC_STATS(net, LINUX_MIB_XFRMINSTATEPROTOERROR);
+					goto drop;
+				}
+
+				if (xo->status & CRYPTO_INVALID_PROTOCOL) {
+					XFRM_INC_STATS(net, LINUX_MIB_XFRMINSTATEPROTOERROR);
+					goto drop;
+				}
+
+				XFRM_INC_STATS(net, LINUX_MIB_XFRMINBUFFERERROR);
+				goto drop;
+			}
+
+			if ((err = xfrm_parse_spi(skb, nexthdr, &spi, &seq)) != 0) {
+				XFRM_INC_STATS(net, LINUX_MIB_XFRMINHDRERROR);
+				goto drop;
+			}
+		}
+
+		goto loop;
+	}
+
+	family = XFRM_SPI_SKB_CB(skb)->family;
+
+	sp = secpath_set(skb);
+	if (!sp) {
+		XFRM_INC_STATS(net, LINUX_MIB_XFRMINERROR);
+		goto drop;
+	}
+
+	seq = 0;
+	if (!spi && xfrm_parse_spi(skb, nexthdr, &spi, &seq)) {
+		secpath_reset(skb);
+		XFRM_INC_STATS(net, LINUX_MIB_XFRMINHDRERROR);
+		goto drop;
+	}
+
+	XFRM_SPI_SKB_CB(skb)->seq = seq;
+
+	/* if tunnel is present override skb->mark value with tunnel i_key */
+	switch (family) {
+	case AF_INET:
+		if (XFRM_TUNNEL_SKB_CB(skb)->tunnel.ip4)
+			mark = be32_to_cpu(XFRM_TUNNEL_SKB_CB(skb)->tunnel.ip4->parms.i_key);
+		break;
+	case AF_INET6:
+		if (XFRM_TUNNEL_SKB_CB(skb)->tunnel.ip6)
+			mark = be32_to_cpu(XFRM_TUNNEL_SKB_CB(skb)->tunnel.ip6->parms.i_key);
+		break;
+	}
+
+loop:
+	err = xfrm_input_loop(net, skb, x, spi, nexthdr, encap_type);
+	if (err)
+		goto drop;
+
+	gro_cells_receive(&gro_cells, skb);
+
+	return err;
+
 drop:
 	xfrm_rcv_cb(skb, family, x && x->type ? x->type->proto : nexthdr, -1);
 	kfree_skb(skb);

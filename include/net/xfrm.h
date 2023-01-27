@@ -25,6 +25,7 @@
 #include <net/ip6_fib.h>
 #include <net/flow.h>
 #include <net/gro_cells.h>
+#include <net/netfilter/nf_flow_table.h>
 
 #include <linux/interrupt.h>
 
@@ -605,6 +606,7 @@ void xfrm_unregister_km(struct xfrm_mgr *km);
 
 struct xfrm_tunnel_skb_cb {
 	union {
+		struct nft_bulk_cb ncb;
 		struct inet_skb_parm h4;
 		struct inet6_skb_parm h6;
 	} header;
@@ -682,6 +684,7 @@ struct xfrm_spi_skb_cb {
 	unsigned int daddroff;
 	unsigned int family;
 	__be32 seq;
+	__be32 spi;
 };
 
 #define XFRM_SPI_SKB_CB(__skb) ((struct xfrm_spi_skb_cb *)&((__skb)->cb[0]))
@@ -1648,6 +1651,7 @@ int __xfrm_init_state(struct xfrm_state *x, bool init_replay, bool offload,
 		      struct netlink_ext_ack *extack);
 int xfrm_init_state(struct xfrm_state *x);
 int xfrm_input(struct sk_buff *skb, int nexthdr, __be32 spi, int encap_type);
+int xfrm_input_list(struct sk_buff **skb, int nexthdr, __be32 spi, int encap_type);
 int xfrm_input_resume(struct sk_buff *skb, int nexthdr);
 int xfrm_trans_queue_net(struct net *net, struct sk_buff *skb,
 			 int (*finish)(struct net *, struct sock *,
@@ -1657,6 +1661,7 @@ int xfrm_trans_queue(struct sk_buff *skb,
 				   struct sk_buff *));
 int xfrm_output_resume(struct sock *sk, struct sk_buff *skb, int err);
 int xfrm_output(struct sock *sk, struct sk_buff *skb);
+struct sk_buff *xfrm_output_list(struct sk_buff *skb);
 
 #if IS_ENABLED(CONFIG_NET_PKTGEN)
 int pktgen_xfrm_outer_mode_output(struct xfrm_state *x, struct sk_buff *skb);
