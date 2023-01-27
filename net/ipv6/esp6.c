@@ -967,7 +967,7 @@ static int esp6_input_done_direct(struct sk_buff *skb, struct xfrm_state *x)
 	struct crypto_aead *aead = x->data;
 	int hlen = sizeof(struct ip_esp_hdr) + crypto_aead_ivsize(aead);
 	int err;
-	int hdr_len;
+	int hdr_len = skb_network_header_len(skb);
 
 	err = esp_remove_trailer(skb);
 	if (unlikely(err < 0))
