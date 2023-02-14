@@ -471,7 +471,7 @@ static enum gro_result dev_gro_receive(struct gro_node *gro,
 	enum gro_result ret;
 	int same_flow;
 
-	if (netif_elide_gro(skb->dev))
+	if (1) //netif_elide_gro(skb->dev))
 		goto normal;
 
 	gro_list_prepare(&gro_list->list, skb);
