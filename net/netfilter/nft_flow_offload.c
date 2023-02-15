@@ -55,7 +55,9 @@ static int nft_dev_fill_forward_path(const struct nf_flow_route *route,
 {
 	const void *daddr = &ct->tuplehash[!dir].tuple.src.u3;
 	struct net_device *dev = dst_cache->dev;
+	struct dst_entry *dst;
 	struct neighbour *n;
+	struct flowi fl;
 	u8 nud_state;
 
 	if (!nft_is_valid_ether_device(dev))
@@ -75,7 +77,39 @@ static int nft_dev_fill_forward_path(const struct nf_flow_route *route,
 		return -1;
 
 out:
-	return dev_fill_forward_path(dev, ha, pkt->skb, stack);
+	dst = route->tuple[dir].dst;
+
+	memset(&fl, 0, sizeof(fl));
+	switch (ct->tuplehash[dir].tuple.src.l3num) {
+	case NFPROTO_IPV4:
+		fl.u.ip4.flowi4_oif = dst->dev->ifindex;
+		fl.u.ip4.flowi4_proto = ct->tuplehash[dir].tuple.dst.protonum;
+		fl.u.ip4.saddr = ct->tuplehash[dir].tuple.src.u3.ip;
+		fl.u.ip4.daddr = ct->tuplehash[dir].tuple.dst.u3.ip;
+		switch (ct->tuplehash[dir].tuple.dst.protonum) {
+		case IPPROTO_TCP:
+		case IPPROTO_UDP:
+			fl.u.ip4.fl4_sport = ct->tuplehash[dir].tuple.src.u.tcp.port;
+			fl.u.ip4.fl4_dport = ct->tuplehash[dir].tuple.dst.u.tcp.port;
+			break;
+		}
+		break;
+	case NFPROTO_IPV6:
+		fl.u.ip6.flowi6_oif = dst->dev->ifindex;
+		fl.u.ip6.flowi6_proto = ct->tuplehash[dir].tuple.dst.protonum;
+		fl.u.ip6.saddr = ct->tuplehash[dir].tuple.src.u3.in6;
+		fl.u.ip6.daddr = ct->tuplehash[dir].tuple.dst.u3.in6;
+		switch (ct->tuplehash[dir].tuple.dst.protonum) {
+		case IPPROTO_TCP:
+		case IPPROTO_UDP:
+			fl.u.ip6.fl6_sport = ct->tuplehash[dir].tuple.src.u.tcp.port;
+			fl.u.ip6.fl6_dport = ct->tuplehash[dir].tuple.dst.u.tcp.port;
+			break;
+		}
+		break;
+	}
+
+	return dev_fill_forward_path(dev, ha, dst, &fl, stack);
 }
 
 struct nft_forward_info {
@@ -99,6 +133,7 @@ static void nft_dev_path_info(struct nf_flow_route *route,
 			      struct nft_forward_info *info,
 			      unsigned char *ha, struct nf_flowtable *flowtable)
 {
+	struct dst_entry *orig_dst = route->tuple[dir].dst;
 	const struct net_device_path *path;
 	int i;
 
@@ -112,6 +147,7 @@ static void nft_dev_path_info(struct nf_flow_route *route,
 		case DEV_PATH_VLAN:
 		case DEV_PATH_PPPOE:
 			info->indev = path->dev;
+
 			if (is_zero_ether_addr(info->h_source))
 				memcpy(info->h_source, path->dev->dev_addr, ETH_ALEN);
 
@@ -157,6 +193,7 @@ static void nft_dev_path_info(struct nf_flow_route *route,
 			info->xmit_type = FLOW_OFFLOAD_XMIT_DIRECT;
 			break;
 		case DEV_PATH_TUNNEL:
+			route->tuple[dir].orig_dst = orig_dst;
 			route->tuple[dir].dst = path->tun.dst;
 			route->tuple[dir].xmit_type = FLOW_OFFLOAD_XMIT_XFRM;
 			break;
@@ -227,6 +264,12 @@ static void nft_dev_forward_path(struct nf_flow_route *route,
 	}
 }
 
+static void nft_route_finish(struct nf_flow_route *route, enum ip_conntrack_dir dir)
+{
+	if (route->tuple[!dir].orig_dst)
+		route->tuple[dir].in.ifindex = route->tuple[!dir].orig_dst->dev->ifindex;
+}
+
 static int nft_flow_route(const struct nft_pktinfo *pkt,
 			  const struct nf_conn *ct,
 			  struct nf_flow_route *route,
@@ -273,6 +316,9 @@ static int nft_flow_route(const struct nft_pktinfo *pkt,
 
 	nft_dev_forward_path(route, pkt, ct, dir, ft);
 	nft_dev_forward_path(route, pkt, ct, !dir, ft);
+
+	nft_route_finish(route, dir);
+	nft_route_finish(route, !dir);
 
 	return 0;
 }
