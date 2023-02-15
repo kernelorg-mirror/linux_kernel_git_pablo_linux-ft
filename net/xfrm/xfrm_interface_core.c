@@ -536,13 +536,10 @@ static int xfrmi_fill_forward_path(struct net_device_path_ctx *ctx,
 
 	ctx->flowi.flowi_oif = xi->p.link;
 
-	dst_hold(ctx->dst);
+	/* ctx.dst already holds reference to dst. */
 	dst = xfrm_lookup_with_ifid(xi->net, ctx->dst, &ctx->flowi, NULL, 0,
 				    xi->p.if_id);
 	if (IS_ERR(dst))
-		return -1;
-
-	if (!dst_hold_safe(dst))
 		return -1;
 
 	x = dst->xfrm;
