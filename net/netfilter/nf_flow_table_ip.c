@@ -796,11 +796,6 @@ void __nf_flow_offload_ip_hook_list(void *priv, struct list_head *head,
 	list_for_each_entry_safe(skb, n, head, list) {
 		skb_list_del_init(skb);
 
-		skb_reset_network_header(skb);
-		if (!skb_transport_header_was_set(skb))
-			skb_reset_transport_header(skb);
-		skb_reset_mac_len(skb);
-
 		ctx.hdrsize = 0;
 		ctx.offset = 0;
 
@@ -1428,11 +1423,6 @@ void __nf_flow_offload_ipv6_hook_list(void *priv, struct list_head *head,
 
 	list_for_each_entry_safe(skb, n, head, list) {
 		skb_list_del_init(skb);
-
-		skb_reset_network_header(skb);
-		if (!skb_transport_header_was_set(skb))
-			skb_reset_transport_header(skb);
-		skb_reset_mac_len(skb);
 
 		ctx.hdrsize = 0;
 		ctx.offset = 0;
