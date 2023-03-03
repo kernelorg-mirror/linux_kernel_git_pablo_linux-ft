@@ -20,6 +20,11 @@ __nf_flow_offload_hook_list(void *priv, struct sk_buff *unused,
 	__be16 proto;
 
 	list_for_each_entry_safe(skb, next, skb_list, list) {
+		skb_reset_network_header(skb);
+		if (!skb_transport_header_was_set(skb))
+			skb_reset_transport_header(skb);
+		skb_reset_mac_len(skb);
+
 		switch (skb->protocol) {
 		case htons(ETH_P_8021Q):
 			veth = (struct vlan_ethhdr *)skb_mac_header(skb);
