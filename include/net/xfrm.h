@@ -2181,6 +2181,8 @@ static inline bool xfrm6_local_dontfrag(const struct sock *sk)
 }
 #endif
 
+int xfrm4_udp_encap_rcv(struct sock *sk, struct sk_buff *skb);
+
 #if (IS_BUILTIN(CONFIG_XFRM_INTERFACE) && IS_ENABLED(CONFIG_DEBUG_INFO_BTF)) || \
     (IS_MODULE(CONFIG_XFRM_INTERFACE) && IS_ENABLED(CONFIG_DEBUG_INFO_BTF_MODULES))
 
