@@ -521,6 +521,15 @@ EXPORT_SYMBOL(xfrm_state_free);
 
 static void ___xfrm_state_destroy(struct xfrm_state *x)
 {
+	if (x->encap && x->encap->encap_type == UDP_ENCAP_ESPINUDP_RX) {
+		struct sock *sk = x->encap_sk;
+
+		lock_sock(sk);
+		sock_put(sk);
+		release_sock(sk);
+		x->encap_sk = NULL;
+	}
+
 	hrtimer_cancel(&x->mtimer);
 	del_timer_sync(&x->rtimer);
 	kfree(x->aead);

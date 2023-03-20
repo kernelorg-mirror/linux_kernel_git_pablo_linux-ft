@@ -468,6 +468,8 @@ static int esp6_output_encap(struct xfrm_state *x, struct sk_buff *skb,
 	switch (encap_type) {
 	default:
 	case UDP_ENCAP_ESPINUDP:
+	case UDP_ENCAP_ESPINUDP_RX:
+	case UDP_ENCAP_ESPINUDP_TX:
 	case UDP_ENCAP_ESPINUDP_NON_IKE:
 		esph = esp6_output_udp_encap(skb, encap_type, esp, sport, dport);
 		break;
@@ -1606,6 +1608,8 @@ static int esp6_init_state(struct xfrm_state *x, struct netlink_ext_ack *extack)
 			err = -EINVAL;
 			goto error;
 		case UDP_ENCAP_ESPINUDP:
+		case UDP_ENCAP_ESPINUDP_RX:
+		case UDP_ENCAP_ESPINUDP_TX:
 			x->props.header_len += sizeof(struct udphdr);
 			break;
 		case UDP_ENCAP_ESPINUDP_NON_IKE:
