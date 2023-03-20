@@ -29,6 +29,7 @@
 #include <net/xfrm.h>
 #include <net/netlink.h>
 #include <net/ah.h>
+#include <net/udp_tunnel.h>
 #include <linux/uaccess.h>
 #if IS_ENABLED(CONFIG_IPV6)
 #include <linux/in6.h>
@@ -779,6 +780,48 @@ error_no_put:
 	return NULL;
 }
 
+static int xfrm_setup_socket(struct net *net, struct xfrm_state *x)
+{
+	struct udp_tunnel_sock_cfg tuncfg = {};
+	struct udp_port_cfg udp_conf = {
+		.family = x->props.family,
+	};
+	struct socket *sock;
+	int err;
+
+	if (!x->encap)
+		return -EOPNOTSUPP;
+
+	switch (x->props.family) {
+	case AF_INET:
+		udp_conf.local_ip.s_addr = x->encap->encap_oa.a4;
+		tuncfg.encap_rcv = xfrm4_udp_encap_rcv;
+		break;
+#if IS_ENABLED(CONFIG_IPV6)
+	case AF_INET6:
+		udp_conf.local_ip6  = x->encap->encap_oa.in6;
+		tuncfg.encap_rcv = ipv6_stub->xfrm6_udp_encap_rcv;
+		break;
+#endif
+	default:
+		return -EOPNOTSUPP;
+	}
+
+	udp_conf.local_udp_port = x->encap->encap_sport;
+
+	err = udp_sock_create(net, &udp_conf, &sock);
+	if (err)
+		return err;
+
+	tuncfg.encap_type = UDP_ENCAP_ESPINUDP_RX;
+
+	setup_udp_tunnel_sock(net, sock, &tuncfg);
+
+	x->encap_sk = sock->sk;
+
+	return 0;
+}
+
 static int xfrm_add_sa(struct sk_buff *skb, struct nlmsghdr *nlh,
 		       struct nlattr **attrs, struct netlink_ext_ack *extack)
 {
@@ -795,6 +838,12 @@ static int xfrm_add_sa(struct sk_buff *skb, struct nlmsghdr *nlh,
 	x = xfrm_state_construct(net, p, attrs, &err, extack);
 	if (!x)
 		return err;
+
+	if (x->encap && x->encap->encap_type == UDP_ENCAP_ESPINUDP_RX) {
+		err = xfrm_setup_socket(net, x);
+		if (err < 0)
+			return err;
+	}
 
 	xfrm_state_hold(x);
 	if (nlh->nlmsg_type == XFRM_MSG_NEWSA)
