@@ -76,6 +76,7 @@ static void *esp_alloc_tmp(struct crypto_aead *aead, int nfrags, int seqihlen)
 
 	len += sizeof(struct aead_request) + crypto_aead_reqsize(aead);
 	len = ALIGN(len, __alignof__(struct scatterlist));
+	len += sizeof(struct esp_info);
 
 	len += sizeof(struct scatterlist) * nfrags;
 
@@ -923,7 +924,7 @@ static int esp6_output_list(struct xfrm_state *x, struct list_head *head)
 	bool slowpath = false;
 
 
-	len = sizeof(struct esp_info);
+	len = 0;
 
 	if (x->props.flags & XFRM_STATE_ESN)
 		len += sizeof(struct esp_output_extra);
@@ -931,7 +932,7 @@ static int esp6_output_list(struct xfrm_state *x, struct list_head *head)
 	aead = x->data;
 	alen = crypto_aead_authsize(aead);
 
-	tmp = esp_alloc_tmp(aead, /*esp->nfrags*/ 1 + 2, len);
+	tmp = esp_alloc_tmp(aead, /*esp->nfrags*/ MAX_SKB_FRAGS + 2, len);
 	if (!tmp)
 		return -ENOMEM;
 
