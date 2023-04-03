@@ -190,6 +190,7 @@ static int nft_set_pktinfo_ingress(struct nft_pktinfo *pkt,
 	return 0;
 }
 
+/*
 static unsigned int nft_do_chain_inet_ingress(void *priv, struct sk_buff *skb,
 					      const struct nf_hook_state *state)
 {
@@ -209,6 +210,59 @@ static unsigned int nft_do_chain_inet_ingress(void *priv, struct sk_buff *skb,
 
 	return nft_do_chain(&pkt, priv);
 }
+*/
+
+static unsigned int
+nft_do_chain_inet_early_ingress(void *priv, struct sk_buff *unused,
+				const struct nf_hook_state *state)
+{
+	struct nf_hook_state ingress_state = *state;
+	struct sk_buff *skb, *nskb;
+	struct nft_pktinfo pkt;
+	LIST_HEAD(tunnel_list);
+	LIST_HEAD(accept_list);
+	int ret;
+
+	list_for_each_entry_safe(skb, nskb, state->skb_list, list) {
+		skb_list_del_init(skb);
+
+		ret = nft_set_pktinfo_ingress(&pkt, skb, &ingress_state);
+		switch (ret) {
+		case 1:
+			list_add_tail(&skb->list, &accept_list);
+			continue;
+		case 0:
+			break;
+		case -1:
+			kfree_skb(skb);
+			continue;
+		default:
+			break;
+		}
+
+		ret = nft_do_chain(&pkt, priv);
+		switch (ret) {
+		case NF_ACCEPT:
+			list_add_tail(&skb->list, &accept_list);
+			break;
+		default:
+			WARN_ON_ONCE(1);
+			fallthrough;
+		case NF_DROP:
+			kfree_skb(skb);
+			break;
+		}
+	}
+
+	WARN_ON_ONCE(!list_empty(state->skb_list));
+
+	list_splice(&accept_list, state->skb_list);
+
+	if (list_empty(state->skb_list))
+		return NF_STOLEN;
+
+	return NF_ACCEPT;
+}
 
 static const struct nft_chain_type nft_chain_filter_inet = {
 	.name		= "filter",
@@ -221,7 +275,7 @@ static const struct nft_chain_type nft_chain_filter_inet = {
 			  (1 << NF_INET_PRE_ROUTING) |
 			  (1 << NF_INET_POST_ROUTING),
 	.hooks		= {
-		[NF_INET_INGRESS]	= nft_do_chain_inet_ingress,
+		[NF_INET_INGRESS]	= nft_do_chain_inet_early_ingress,
 		[NF_INET_LOCAL_IN]	= nft_do_chain_inet,
 		[NF_INET_LOCAL_OUT]	= nft_do_chain_inet,
 		[NF_INET_FORWARD]	= nft_do_chain_inet,
