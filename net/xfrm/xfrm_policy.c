@@ -3434,20 +3434,14 @@ decode_session4(struct sk_buff *skb, struct flowi *fl, bool reverse)
 static void
 decode_session6(struct sk_buff *skb, struct flowi *fl, bool reverse)
 {
+	u8 nexthdr = ipv6_hdr(skb)->nexthdr;
 	struct flowi6 *fl6 = &fl->u.ip6;
 	int onlyproto = 0;
 	const struct ipv6hdr *hdr = ipv6_hdr(skb);
 	u32 offset = sizeof(*hdr);
 	struct ipv6_opt_hdr *exthdr;
 	const unsigned char *nh = skb_network_header(skb);
-	u16 nhoff = IP6CB(skb)->nhoff;
 	int oif = 0;
-	u8 nexthdr;
-
-	if (!nhoff)
-		nhoff = offsetof(struct ipv6hdr, nexthdr);
-
-	nexthdr = nh[nhoff];
 
 	if (skb_dst(skb) && skb_dst(skb)->dev)
 		oif = skb_dst(skb)->dev->ifindex;
