@@ -80,6 +80,8 @@ __nf_flow_offload_hook_list(void *priv, struct sk_buff *unused,
 
 	if (flags & (1 << NFPROTO_IPV4) && !list_empty(&skb_ipv4_list))
 		__nf_flow_offload_ip_hook_list(priv, &skb_ipv4_list, state->in);
+	if (flags & (1 << NFPROTO_IPV6) && !list_empty(&skb_ipv6_list))
+		__nf_flow_offload_ipv6_hook_list(priv, &skb_ipv6_list, state->in);
 
 	list_splice_tail(&skb_ipv4_list, skb_list);
 	list_splice_tail(&skb_ipv6_list, skb_list);
