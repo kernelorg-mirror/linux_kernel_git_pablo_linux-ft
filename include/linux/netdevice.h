@@ -2227,6 +2227,7 @@ struct net_device {
 	struct netdev_queue __rcu *ingress_queue;
 #ifdef CONFIG_NETFILTER_INGRESS
 	struct nf_hook_entries __rcu *nf_hooks_ingress;
+	struct nf_hook_entries __rcu *nf_hooks_early_ingress;
 #endif
 
 	unsigned char		broadcast[MAX_ADDR_LEN];

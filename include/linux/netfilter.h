@@ -65,6 +65,7 @@ struct nf_hook_ops;
 struct sock;
 
 struct nf_hook_state {
+	struct list_head *skb_list;
 	u8 hook;
 	u8 pf;
 	struct net_device *in;
@@ -201,6 +202,9 @@ int nf_hook_slow(struct sk_buff *skb, struct nf_hook_state *state,
 
 void nf_hook_slow_list(struct list_head *head, struct nf_hook_state *state,
 		       const struct nf_hook_entries *e);
+int __nf_hook_slow_list(struct sk_buff *skb, struct nf_hook_state *state,
+			const struct nf_hook_entries *e, unsigned int s);
+
 /**
  *	nf_hook - call a netfilter hook
  *

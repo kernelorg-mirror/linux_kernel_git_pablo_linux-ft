@@ -15,7 +15,7 @@
 #include <net/flow_offload.h>
 #include <net/netns/generic.h>
 
-#define NFT_MAX_HOOKS	(NF_INET_INGRESS + 1)
+#define NFT_MAX_HOOKS	(NF_INET_EARLY_INGRESS + 1)
 
 struct module;
 
@@ -1221,7 +1221,8 @@ static inline bool nft_table_has_owner(const struct nft_table *table)
 static inline bool nft_base_chain_netdev(int family, u32 hooknum)
 {
 	return family == NFPROTO_NETDEV ||
-	       (family == NFPROTO_INET && hooknum == NF_INET_INGRESS);
+	       (family == NFPROTO_INET && hooknum == NF_INET_INGRESS) ||
+	       (family == NFPROTO_INET && hooknum == NF_INET_EARLY_INGRESS);
 }
 
 void nft_register_chain_type(const struct nft_chain_type *);
