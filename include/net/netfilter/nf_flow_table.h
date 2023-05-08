@@ -18,6 +18,13 @@ struct nf_flow_rule;
 struct flow_offload;
 enum flow_offload_tuple_dir;
 
+struct nft_bulk_cb {
+	struct sk_buff *last;
+	struct flow_offload_tuple_rhash *tuplehash;
+};
+
+#define NFT_BULK_CB(skb) ((struct nft_bulk_cb *)(skb)->cb)
+
 struct nf_flow_key {
 	struct flow_dissector_key_meta			meta;
 	struct flow_dissector_key_control		control;
@@ -62,6 +69,7 @@ struct nf_flowtable_type {
 						  struct nf_flow_rule *flow_rule);
 	void				(*free)(struct nf_flowtable *ft);
 	nf_hookfn			*hook;
+	nf_hookfn			*hook_list;
 	struct module			*owner;
 };
 
@@ -73,6 +81,7 @@ enum nf_flowtable_flags {
 struct nf_flowtable {
 	struct list_head		list;
 	struct rhashtable		rhashtable;
+	struct list_head		__percpu *bulk_list;
 	int				priority;
 	const struct nf_flowtable_type	*type;
 	struct delayed_work		gc_work;
@@ -297,6 +306,8 @@ unsigned int nf_flow_offload_ip_hook(void *priv, struct sk_buff *skb,
 				     const struct nf_hook_state *state);
 unsigned int nf_flow_offload_ipv6_hook(void *priv, struct sk_buff *skb,
 				       const struct nf_hook_state *state);
+void __nf_flow_offload_ip_hook_list(void *priv, struct list_head *head,
+				    const struct net_device *in);
 
 #define MODULE_ALIAS_NF_FLOWTABLE(family)	\
 	MODULE_ALIAS("nf-flowtable-" __stringify(family))
