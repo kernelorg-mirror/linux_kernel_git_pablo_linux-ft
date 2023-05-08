@@ -161,32 +161,50 @@ static unsigned int nft_do_chain_inet(void *priv, struct sk_buff *skb,
 	return nft_do_chain(&pkt, priv);
 }
 
+static int nft_set_pktinfo_ingress(struct nft_pktinfo *pkt,
+				   struct sk_buff *skb,
+				   struct nf_hook_state *ingress_state)
+{
+	switch (skb->protocol) {
+	case htons(ETH_P_IP):
+		/* Original hook is NFPROTO_NETDEV and NF_NETDEV_INGRESS. */
+		ingress_state->pf = NFPROTO_IPV4;
+		ingress_state->hook = NF_INET_INGRESS;
+		nft_set_pktinfo(pkt, skb, ingress_state);
+
+		if (nft_set_pktinfo_ipv4_ingress(pkt) < 0)
+			return -1;
+		break;
+	case htons(ETH_P_IPV6):
+		ingress_state->pf = NFPROTO_IPV6;
+		ingress_state->hook = NF_INET_INGRESS;
+		nft_set_pktinfo(pkt, skb, ingress_state);
+
+		if (nft_set_pktinfo_ipv6_ingress(pkt) < 0)
+			return -1;
+		break;
+	default:
+		return 1;
+	}
+
+	return 0;
+}
+
 static unsigned int nft_do_chain_inet_ingress(void *priv, struct sk_buff *skb,
 					      const struct nf_hook_state *state)
 {
 	struct nf_hook_state ingress_state = *state;
 	struct nft_pktinfo pkt;
+	int ret;
 
-	switch (skb->protocol) {
-	case htons(ETH_P_IP):
-		/* Original hook is NFPROTO_NETDEV and NF_NETDEV_INGRESS. */
-		ingress_state.pf = NFPROTO_IPV4;
-		ingress_state.hook = NF_INET_INGRESS;
-		nft_set_pktinfo(&pkt, skb, &ingress_state);
-
-		if (nft_set_pktinfo_ipv4_ingress(&pkt) < 0)
-			return NF_DROP;
-		break;
-	case htons(ETH_P_IPV6):
-		ingress_state.pf = NFPROTO_IPV6;
-		ingress_state.hook = NF_INET_INGRESS;
-		nft_set_pktinfo(&pkt, skb, &ingress_state);
-
-		if (nft_set_pktinfo_ipv6_ingress(&pkt) < 0)
-			return NF_DROP;
-		break;
-	default:
+	ret = nft_set_pktinfo_ingress(&pkt, skb, &ingress_state);
+	switch (ret) {
+	case -1:
+		return NF_DROP;
+	case 1:
 		return NF_ACCEPT;
+	default:
+		break;
 	}
 
 	return nft_do_chain(&pkt, priv);
