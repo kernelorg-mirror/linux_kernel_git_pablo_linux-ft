@@ -308,6 +308,8 @@ unsigned int nf_flow_offload_ipv6_hook(void *priv, struct sk_buff *skb,
 				       const struct nf_hook_state *state);
 void __nf_flow_offload_ip_hook_list(void *priv, struct list_head *head,
 				    const struct net_device *in);
+void __nf_flow_offload_ipv6_hook_list(void *priv, struct list_head *head,
+				      const struct net_device *in);
 
 #define MODULE_ALIAS_NF_FLOWTABLE(family)	\
 	MODULE_ALIAS("nf-flowtable-" __stringify(family))
