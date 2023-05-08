@@ -942,3 +942,146 @@ nf_flow_offload_ipv6_hook(void *priv, struct sk_buff *skb,
 	return ret;
 }
 EXPORT_SYMBOL_GPL(nf_flow_offload_ipv6_hook);
+
+static void nft_bulk_ipv6_receive(struct list_head *head, struct sk_buff *skb)
+{
+	const struct in6_addr *daddr;
+	const struct ipv6hdr *ip6h;
+	struct dst_entry *dst;
+	struct xfrm_state *x;
+	struct rt6_info *rt;
+	struct sk_buff *p;
+	int proto;
+
+	ip6h = ipv6_hdr(skb);
+	dst = skb_dst(skb);
+	BUG_ON(!dst);
+
+	rt = (struct rt6_info *)dst;
+	daddr = rt6_nexthop(rt, &ip6h->daddr);
+	x = dst_xfrm(dst);
+	proto = ip6h->nexthdr;
+
+	list_for_each_entry(p, head, list) {
+		const struct in6_addr *daddr2;
+		struct dst_entry *dst2;
+		struct ipv6hdr *ip6h2;
+		struct rt6_info *rt2;
+
+		if (p->protocol != htons(ETH_P_IPV6))
+			continue;
+
+		dst2 = skb_dst(p);
+		rt2 = (struct rt6_info *)dst2;
+		if (dst->dev != dst2->dev)
+			continue;
+
+		ip6h2 = ipv6_hdr(p);
+		daddr2 = rt6_nexthop(rt2, &ip6h2->daddr);
+		if (!ipv6_addr_equal(daddr, daddr2))
+			continue;
+
+		if (x != dst_xfrm(dst2))
+			continue;
+
+		goto found;
+	}
+
+	goto out;
+
+found:
+	if (NFT_BULK_CB(p)->last == p)
+		skb_shinfo(p)->frag_list = skb;
+	else
+		NFT_BULK_CB(p)->last->next = skb;
+
+	NFT_BULK_CB(p)->last = skb;
+
+	return;
+out:
+	/* First skb */
+	NFT_BULK_CB(skb)->last = skb;
+	list_add_tail(&skb->list, head);
+
+	return;
+
+}
+
+void __nf_flow_offload_ipv6_hook_list(void *priv, struct list_head *head,
+				      const struct net_device *in)
+{
+	struct flow_offload_tuple_rhash *tuplehash;
+	struct nf_flowtable *flow_table = priv;
+	struct nf_flowtable_ctx ctx = {
+		.in	= in,
+	};
+	struct list_head *bulk_head;
+	struct sk_buff *skb, *n;
+	struct neighbour *neigh;
+	LIST_HEAD(bulk_list);
+	LIST_HEAD(acc_list);
+	struct rt6_info *rt;
+	int ret;
+
+	preempt_disable();
+	bulk_head = this_cpu_ptr(flow_table->bulk_list);
+
+	list_for_each_entry_safe(skb, n, head, list) {
+		skb_list_del_init(skb);
+
+		ctx.hdrsize = 0;
+		ctx.offset = 0;
+
+		tuplehash = nf_flow_offload_ipv6_lookup(&ctx, flow_table, skb);
+		if (!tuplehash) {
+			list_add_tail(&skb->list, &acc_list);
+			continue;
+		}
+
+		ret = nf_flow_offload_ipv6_forward(&ctx, flow_table, tuplehash, skb);
+		if (ret < 0) {
+			kfree_skb(skb);
+			continue;
+		} else if (ret == 0) {
+			list_add_tail(&skb->list, &acc_list);
+			continue;
+		}
+
+		skb_dst_set_noref(skb, tuplehash->tuple.dst_cache);
+		memset(skb->cb, 0, sizeof(struct nft_bulk_cb));
+		NFT_BULK_CB(skb)->tuplehash = tuplehash;
+
+		list_add_tail(&skb->list, &bulk_list);
+	}
+
+	list_splice_init(&acc_list, head);
+
+	list_for_each_entry_safe(skb, n, &bulk_list, list) {
+		skb_list_del_init(skb);
+		nft_bulk_ipv6_receive(bulk_head, skb);
+	}
+
+	list_for_each_entry_safe(skb, n, bulk_head, list) {
+
+		list_del_init(&skb->list);
+
+		skb->next = skb_shinfo(skb)->frag_list;
+		skb_shinfo(skb)->frag_list = NULL;
+
+		tuplehash = NFT_BULK_CB(skb)->tuplehash;
+		skb_dst_set_noref(skb, tuplehash->tuple.dst_cache);
+		rt = (struct rt6_info *)skb_dst(skb);
+
+		neigh = ip_neigh_gw6(rt->dst.dev, rt6_nexthop(rt, &ipv6_hdr(skb)->daddr));
+		if (IS_ERR(neigh)) {
+			kfree_skb_list(skb);
+			continue;
+		}
+
+		nf_flow_neigh_xmit_list(skb, rt->dst.dev, neigh->ha);
+	}
+	preempt_enable();
+
+	BUG_ON(!list_empty(bulk_head));
+}
+EXPORT_SYMBOL_GPL(__nf_flow_offload_ipv6_hook_list);
