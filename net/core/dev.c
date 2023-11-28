@@ -4228,6 +4228,17 @@ struct netdev_queue *netdev_core_pick_tx(struct net_device *dev,
 	return netdev_get_tx_queue(dev, queue_index);
 }
 
+/* If device/qdisc don't need skb->dst, release it right now while
+ * its hot in this cpu cache.
+ */
+static inline void dev_dst_drop(const struct net_device *dev, struct sk_buff *skb)
+{
+	if (dev->priv_flags & IFF_XMIT_DST_RELEASE)
+		skb_dst_drop(skb);
+	else
+		skb_dst_force(skb);
+}
+
 /**
  * __dev_queue_xmit() - transmit a buffer
  * @skb:	buffer to transmit
@@ -4292,13 +4303,7 @@ int __dev_queue_xmit(struct sk_buff *skb, struct net_device *sb_dev)
 			txq = netdev_tx_queue_mapping(dev, skb);
 	}
 #endif
-	/* If device/qdisc don't need skb->dst, release it right now while
-	 * its hot in this cpu cache.
-	 */
-	if (dev->priv_flags & IFF_XMIT_DST_RELEASE)
-		skb_dst_drop(skb);
-	else
-		skb_dst_force(skb);
+	dev_dst_drop(dev, skb);
 
 	if (!txq)
 		txq = netdev_core_pick_tx(dev, skb, sb_dev);
