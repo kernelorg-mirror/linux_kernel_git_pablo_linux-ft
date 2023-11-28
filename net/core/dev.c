@@ -4239,6 +4239,68 @@ static inline void dev_dst_drop(const struct net_device *dev, struct sk_buff *sk
 		skb_dst_force(skb);
 }
 
+/* The device has no queue. Common case for software devices:
+ * loopback, all the sorts of tunnels...
+ *
+ * Really, it is unlikely that netif_tx_lock protection is necessary
+ * here.  (f.e. loopback and IP tunnels are clean ignoring statistics
+ * counters.)
+ * However, it is possible, that they rely on protection
+ * made by us here.
+ *
+ * Check this and shot the lock. It is not prone from deadlocks.
+ * Either shot noqueue qdisc, it is even simpler 8)
+ */
+static inline int dev_noqueue_xmit_list(struct sk_buff *skb,
+					struct net_device *dev,
+					struct netdev_queue *txq)
+{
+	bool again = false;
+	int rc = -ENOMEM;
+
+	if (dev->flags & IFF_UP) {
+		int cpu = smp_processor_id(); /* ok because BHs are off */
+
+		/* Other cpus might concurrently change txq->xmit_lock_owner
+		 * to -1 or to their cpu id, but not to our id.
+		 */
+		if (READ_ONCE(txq->xmit_lock_owner) != cpu) {
+			if (dev_xmit_recursion())
+				goto recursion_alert;
+
+			skb = validate_xmit_skb_list(skb, dev, &again);
+			if (!skb)
+				goto out;
+
+			HARD_TX_LOCK(dev, txq, cpu);
+
+			if (!netif_xmit_stopped(txq)) {
+				dev_xmit_recursion_inc();
+				skb = dev_hard_start_xmit(skb, dev, txq, &rc);
+				dev_xmit_recursion_dec();
+				if (dev_xmit_complete(rc)) {
+					HARD_TX_UNLOCK(dev, txq);
+					goto out;
+				}
+			}
+			HARD_TX_UNLOCK(dev, txq);
+			net_crit_ratelimited("Virtual device %s asks to queue packet!\n",
+					     dev->name);
+		} else {
+			/* Recursion is detected! It is possible,
+			 * unfortunately
+			 */
+recursion_alert:
+			net_crit_ratelimited("Dead loop on virtual device %s, fix it urgently!\n",
+					     dev->name);
+		}
+	}
+
+	rc = -ENETDOWN;
+out:
+	return rc;
+}
+
 /**
  * __dev_queue_xmit() - transmit a buffer
  * @skb:	buffer to transmit
@@ -4266,7 +4328,6 @@ int __dev_queue_xmit(struct sk_buff *skb, struct net_device *sb_dev)
 	struct netdev_queue *txq = NULL;
 	struct Qdisc *q;
 	int rc = -ENOMEM;
-	bool again = false;
 
 	skb_reset_mac_header(skb);
 	skb_assert_len(skb);
@@ -4316,62 +4377,13 @@ int __dev_queue_xmit(struct sk_buff *skb, struct net_device *sb_dev)
 		goto out;
 	}
 
-	/* The device has no queue. Common case for software devices:
-	 * loopback, all the sorts of tunnels...
-
-	 * Really, it is unlikely that netif_tx_lock protection is necessary
-	 * here.  (f.e. loopback and IP tunnels are clean ignoring statistics
-	 * counters.)
-	 * However, it is possible, that they rely on protection
-	 * made by us here.
-
-	 * Check this and shot the lock. It is not prone from deadlocks.
-	 *Either shot noqueue qdisc, it is even simpler 8)
-	 */
-	if (dev->flags & IFF_UP) {
-		int cpu = smp_processor_id(); /* ok because BHs are off */
-
-		/* Other cpus might concurrently change txq->xmit_lock_owner
-		 * to -1 or to their cpu id, but not to our id.
-		 */
-		if (READ_ONCE(txq->xmit_lock_owner) != cpu) {
-			if (dev_xmit_recursion())
-				goto recursion_alert;
-
-			skb = validate_xmit_skb(skb, dev, &again);
-			if (!skb)
-				goto out;
-
-			HARD_TX_LOCK(dev, txq, cpu);
-
-			if (!netif_xmit_stopped(txq)) {
-				dev_xmit_recursion_inc();
-				skb = dev_hard_start_xmit(skb, dev, txq, &rc);
-				dev_xmit_recursion_dec();
-				if (dev_xmit_complete(rc)) {
-					HARD_TX_UNLOCK(dev, txq);
-					goto out;
-				}
-			}
-			HARD_TX_UNLOCK(dev, txq);
-			net_crit_ratelimited("Virtual device %s asks to queue packet!\n",
-					     dev->name);
-		} else {
-			/* Recursion is detected! It is possible,
-			 * unfortunately
-			 */
-recursion_alert:
-			net_crit_ratelimited("Dead loop on virtual device %s, fix it urgently!\n",
-					     dev->name);
-		}
-	}
-
-	rc = -ENETDOWN;
+	rc = dev_noqueue_xmit_list(skb, dev, txq);
 	rcu_read_unlock_bh();
 
-	dev_core_stats_tx_dropped_inc(dev);
-	kfree_skb_list(skb);
-	return rc;
+	if (rc < 0) {
+		dev_core_stats_tx_dropped_inc(dev);
+		kfree_skb_list(skb);
+	}
 out:
 	rcu_read_unlock_bh();
 	return rc;
