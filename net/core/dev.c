@@ -4427,6 +4427,134 @@ drop:
 }
 EXPORT_SYMBOL(__dev_direct_xmit);
 
+static int dev_queue_xmit_skb_list(struct sk_buff *skb, struct Qdisc *q,
+				   struct net_device *dev,
+				   struct netdev_queue *txq)
+{
+	spinlock_t *root_lock = qdisc_lock(q);
+	struct sk_buff *to_free = NULL;
+	bool contended;
+	int rc = -1;
+
+	if (q->flags & TCQ_F_NOLOCK) {
+		if (q->flags & TCQ_F_CAN_BYPASS && nolock_qdisc_is_empty(q) &&
+		    qdisc_run_begin(q)) {
+			/* Retest nolock_qdisc_is_empty() within the protection
+			 * of q->seqlock to protect from racing with requeuing.
+			 */
+			if (unlikely(!nolock_qdisc_is_empty(q))) {
+				qdisc_run_end(q);
+				return -1;
+			}
+
+			if (sch_direct_xmit(skb, q, dev, txq, NULL, false) &&
+			    !nolock_qdisc_is_empty(q))
+				__qdisc_run(q);
+
+			qdisc_run_end(q);
+			return NET_XMIT_SUCCESS;
+		}
+	}
+
+	/*
+	 * Heuristic to force contended enqueues to serialize on a
+	 * separate lock before trying to get qdisc main lock.
+	 * This permits qdisc->running owner to get the lock more
+	 * often and dequeue packets faster.
+	 * On PREEMPT_RT it is possible to preempt the qdisc owner during xmit
+	 * and then other tasks will only enqueue packets. The packets will be
+	 * sent after the qdisc owner is scheduled again. To prevent this
+	 * scenario the task always serialize on the lock.
+	 */
+	contended = qdisc_is_running(q) || IS_ENABLED(CONFIG_PREEMPT_RT);
+	if (unlikely(contended))
+		spin_lock(&q->busylock);
+
+	spin_lock(root_lock);
+	if (unlikely(test_bit(__QDISC_STATE_DEACTIVATED, &q->state))) {
+		__qdisc_drop(skb, &to_free);
+		rc = NET_XMIT_DROP;
+	} else if ((q->flags & TCQ_F_CAN_BYPASS) && !qdisc_qlen(q) &&
+		   qdisc_run_begin(q)) {
+		/*
+		 * This is a work-conserving queue; there are no old skbs
+		 * waiting to be sent out; and the qdisc is not running -
+		 * xmit the skb directly.
+		 */
+
+		qdisc_bstats_update(q, skb);
+
+		if (sch_direct_xmit(skb, q, dev, txq, root_lock, true)) {
+			if (unlikely(contended)) {
+				spin_unlock(&q->busylock);
+				contended = false;
+			}
+			__qdisc_run(q);
+		}
+
+		qdisc_run_end(q);
+		rc = NET_XMIT_SUCCESS;
+	}
+
+	spin_unlock(root_lock);
+	if (unlikely(to_free))
+		kfree_skb_list_reason(to_free, SKB_DROP_REASON_QDISC_DROP);
+	if (unlikely(contended))
+		spin_unlock(&q->busylock);
+
+	return rc;
+}
+
+int dev_queue_xmit_list(struct sk_buff *skb)
+{
+	struct net_device *dev = skb->dev;
+	struct netdev_queue *txq;
+	struct sk_buff *iter;
+	struct Qdisc *q;
+	int rc;
+
+	/* Disable soft irqs for various locks below. Also
+	 * stops preemption for RCU.
+	 */
+	rcu_read_lock_bh();
+
+	/* Intentionally, no egress hooks here. This is called from the ingress
+	 * path, which should have already classified packets before calling
+	 * this function.
+	 */
+
+	txq = netdev_tx_queue_mapping(dev, skb);
+	if (!txq)
+		txq = netdev_core_pick_tx(dev, skb, NULL);
+
+	q = rcu_dereference_bh(txq->qdisc);
+
+	iter = skb;
+	while (iter) {
+		dev_dst_drop(dev, iter);
+		skb_copy_queue_mapping(iter, skb);
+		iter = iter->next;
+	}
+
+	if (q->enqueue) {
+		rc = dev_queue_xmit_skb_list(skb, q, dev, txq);
+		goto out;
+	}
+
+	rc = dev_noqueue_xmit_list(skb, dev, txq);
+	rcu_read_unlock_bh();
+
+	if (rc < 0) {
+		dev_core_stats_tx_dropped_inc(dev);
+		kfree_skb_list(skb);
+	}
+	return rc;
+out:
+	rcu_read_unlock_bh();
+	return rc;
+}
+EXPORT_SYMBOL(dev_queue_xmit_list);
+
 /*************************************************************************
  *			Receiver routines
  *************************************************************************/

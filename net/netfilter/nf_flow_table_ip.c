@@ -496,14 +496,16 @@ static void nf_flow_neigh_xmit_list(struct sk_buff *skb, struct net_device *outd
 		iter = iter->next;
 	}
 
-	iter = skb;
-	while (iter) {
-		struct sk_buff *next;
+	if (dev_queue_xmit_list(skb) == -1) {
+		iter = skb;
+		while (iter) {
+			struct sk_buff *next;
 
-		next = iter->next;
-		iter->next = NULL;
-		dev_queue_xmit(iter);
-		iter = next;
+			next = iter->next;
+			iter->next = NULL;
+			dev_queue_xmit(iter);
+			iter = next;
+		}
 	}
 }
 
