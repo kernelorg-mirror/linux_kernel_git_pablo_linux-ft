@@ -456,31 +456,45 @@ static int xfrm_inner_mode_input(struct xfrm_state *x,
 	return -EOPNOTSUPP;
 }
 
+struct xfrm_input_ctx {
+	struct net		*net;
+	struct xfrm_state	*x;
+	__be32			spi;
+	int			nexthdr;
+	int			async;
+	u32			mark;
+	bool			crypto_done;
+};
+
+static int xfrm_input_loop(struct xfrm_input_ctx *ctx, struct sk_buff *skb,
+			   int encap_type);
+
 /* NOTE: encap_type - In addition to the normal (non-negative) values for
  * encap_type, a negative value of -1 or -2 can be used to resume/restart this
  * function after a previous invocation early terminated for async operation.
  */
 int xfrm_input(struct sk_buff *skb, int nexthdr, __be32 spi, int encap_type)
 {
+	struct xfrm_offload *xo = xfrm_offload(skb);
 	const struct xfrm_state_afinfo *afinfo;
 	struct net *net = dev_net(skb->dev);
-	int err;
-	__be32 seq;
-	__be32 seq_hi;
-	struct xfrm_state *x = NULL;
-	xfrm_address_t *daddr;
-	u32 mark = skb->mark;
+	struct xfrm_input_ctx ctx = {
+		.net		= net,
+		.spi		= spi,
+		.nexthdr	= nexthdr,
+		.mark		= skb->mark,
+	};
 	unsigned int family = AF_UNSPEC;
-	int decaps = 0;
-	int async = 0;
+	struct xfrm_state *x = NULL;
 	bool xfrm_gro = false;
-	bool crypto_done = false;
-	struct xfrm_offload *xo = xfrm_offload(skb);
 	struct sec_path *sp;
+	__be32 seq;
+	int err;
 
 	if (encap_type < 0 || (xo && (xo->flags & XFRM_GRO || encap_type == 0 ||
 				      encap_type == UDP_ENCAP_ESPINUDP))) {
 		x = xfrm_input_state(skb);
+		ctx.x = x;
 
 		if (unlikely(x->km.state != XFRM_STATE_VALID)) {
 			if (x->km.state == XFRM_STATE_ACQ)
@@ -498,20 +512,17 @@ int xfrm_input(struct sk_buff *skb, int nexthdr, __be32 spi, int encap_type)
 
 		/* An encap_type of -2 indicates reconstructed inner packet */
 		if (encap_type == -2)
-			goto resume_decapped;
+			goto loop;
 
 		/* An encap_type of -1 indicates async resumption. */
-		if (encap_type == -1) {
-			async = 1;
-			dev_put(skb->dev);
-			seq = XFRM_SKB_CB(skb)->seq.input.low;
-			goto resume;
-		}
+		if (encap_type == -1)
+			goto loop;
+
 		/* GRO call */
 		seq = XFRM_SPI_SKB_CB(skb)->seq;
 
 		if (xo && (xo->flags & CRYPTO_DONE)) {
-			crypto_done = true;
+			ctx.crypto_done = true;
 			family = XFRM_SPI_SKB_CB(skb)->family;
 
 			if (!(xo->status & CRYPTO_SUCCESS)) {
@@ -537,28 +548,16 @@ int xfrm_input(struct sk_buff *skb, int nexthdr, __be32 spi, int encap_type)
 				goto drop;
 			}
 
-			if (xfrm_parse_spi(skb, nexthdr, &spi, &seq)) {
+			if (xfrm_parse_spi(skb, nexthdr, &ctx.spi, &seq)) {
 				XFRM_INC_STATS(net, LINUX_MIB_XFRMINHDRERROR);
 				goto drop;
 			}
 		}
 
-		goto lock;
+		goto loop;
 	}
 
 	family = XFRM_SPI_SKB_CB(skb)->family;
-
-	/* if tunnel is present override skb->mark value with tunnel i_key */
-	switch (family) {
-	case AF_INET:
-		if (XFRM_TUNNEL_SKB_CB(skb)->tunnel.ip4)
-			mark = be32_to_cpu(XFRM_TUNNEL_SKB_CB(skb)->tunnel.ip4->parms.i_key);
-		break;
-	case AF_INET6:
-		if (XFRM_TUNNEL_SKB_CB(skb)->tunnel.ip6)
-			mark = be32_to_cpu(XFRM_TUNNEL_SKB_CB(skb)->tunnel.ip6->parms.i_key);
-		break;
-	}
 
 	sp = secpath_set(skb);
 	if (!sp) {
@@ -567,18 +566,120 @@ int xfrm_input(struct sk_buff *skb, int nexthdr, __be32 spi, int encap_type)
 	}
 
 	seq = 0;
-	if (!spi && xfrm_parse_spi(skb, nexthdr, &spi, &seq)) {
+	if (!spi && xfrm_parse_spi(skb, nexthdr, &ctx.spi, &seq)) {
 		secpath_reset(skb);
 		XFRM_INC_STATS(net, LINUX_MIB_XFRMINHDRERROR);
 		goto drop;
 	}
 
+	XFRM_SPI_SKB_CB(skb)->seq = seq;
+
+	/* if tunnel is present override skb->mark value with tunnel i_key */
+	switch (family) {
+	case AF_INET:
+		if (XFRM_TUNNEL_SKB_CB(skb)->tunnel.ip4)
+			ctx.mark = be32_to_cpu(XFRM_TUNNEL_SKB_CB(skb)->tunnel.ip4->parms.i_key);
+		break;
+	case AF_INET6:
+		if (XFRM_TUNNEL_SKB_CB(skb)->tunnel.ip6)
+			ctx.mark = be32_to_cpu(XFRM_TUNNEL_SKB_CB(skb)->tunnel.ip6->parms.i_key);
+		break;
+	}
+loop:
+	err = xfrm_input_loop(&ctx, skb, encap_type);
+	if (err) {
+		if (err == -EINPROGRESS)
+			return 0;
+
+		goto drop;
+	}
+
+	x = ctx.x;
+
+	if (x->outer_mode.flags & XFRM_MODE_FLAG_TUNNEL) {
+		sp = skb_sec_path(skb);
+		if (sp)
+			sp->olen = 0;
+		if (skb_valid_dst(skb))
+			skb_dst_drop(skb);
+		gro_cells_receive(&gro_cells, skb);
+		return 0;
+	} else {
+		xo = xfrm_offload(skb);
+		if (xo)
+			xfrm_gro = xo->flags & XFRM_GRO;
+
+		err = -EAFNOSUPPORT;
+		rcu_read_lock();
+		afinfo = xfrm_state_afinfo_get_rcu(x->props.family);
+		if (likely(afinfo))
+			err = afinfo->transport_finish(skb, xfrm_gro || ctx.async);
+		rcu_read_unlock();
+		if (xfrm_gro) {
+			sp = skb_sec_path(skb);
+			if (sp)
+				sp->olen = 0;
+			if (skb_valid_dst(skb))
+				skb_dst_drop(skb);
+			gro_cells_receive(&gro_cells, skb);
+			return err;
+		}
+
+		return err;
+	}
+drop:
+	xfrm_rcv_cb(skb, family, x && x->type ? x->type->proto : nexthdr, -1);
+	kfree_skb(skb);
+	return 0;
+}
+EXPORT_SYMBOL(xfrm_input);
+
+static int xfrm_input_loop(struct xfrm_input_ctx *ctx, struct sk_buff *skb,
+			   int encap_type)
+{
+	struct xfrm_offload *xo = xfrm_offload(skb);
+	struct xfrm_state *x = ctx->x;
+	struct net *net = ctx->net;
+	int nexthdr = ctx->nexthdr;
+	__be32 spi = ctx->spi;
+	xfrm_address_t *daddr;
+	u32 mark = ctx->mark;
+	unsigned int family;
+	struct sec_path *sp;
+	__be32 seq_hi, seq;
+	int err = 0;
+
+	/* An encap_type of -2 indicates reconstructed inner packet */
+	if (encap_type == -2) {
+		family = x->outer_mode.family;
+		goto resume_decapped;
+	}
+
+	/* An encap_type of -1 indicates async resumption. */
+	if (encap_type == -1) {
+		family = x->outer_mode.family;
+		ctx->async = 1;
+		dev_put(skb->dev);
+		seq = XFRM_SKB_CB(skb)->seq.input.low;
+		goto resume;
+	}
+
+	seq = XFRM_SPI_SKB_CB(skb)->seq;
+
+	if (xo && (xo->flags & XFRM_GRO || encap_type == 0 || encap_type == UDP_ENCAP_ESPINUDP)) {
+		family = x->outer_mode.family;
+		goto lock;
+	}
+
 	daddr = (xfrm_address_t *)(skb_network_header(skb) +
 				   XFRM_SPI_SKB_CB(skb)->daddroff);
+
+	family = XFRM_SPI_SKB_CB(skb)->family;
+
 	do {
 		sp = skb_sec_path(skb);
 
-		if (sp->len == XFRM_MAX_DEPTH) {
+		if (sp && sp->len == XFRM_MAX_DEPTH) {
 			secpath_reset(skb);
 			XFRM_INC_STATS(net, LINUX_MIB_XFRMINBUFFERERROR);
 			goto drop;
@@ -603,7 +704,8 @@ int xfrm_input(struct sk_buff *skb, int nexthdr, __be32 spi, int encap_type)
 
 		skb->mark = xfrm_smark_get(skb->mark, x);
 
-		sp->xvec[sp->len++] = x;
+		if (sp)
+			sp->xvec[sp->len++] = x;
 
 		skb_dst_force(skb);
 		if (!skb_dst(skb)) {
@@ -650,14 +752,14 @@ lock:
 		XFRM_SKB_CB(skb)->seq.input.low = seq;
 		XFRM_SKB_CB(skb)->seq.input.hi = seq_hi;
 
-		if (crypto_done) {
+		if (ctx->crypto_done) {
 			nexthdr = x->type_offload->input_tail(x, skb);
 		} else {
 			dev_hold(skb->dev);
 
 			nexthdr = x->type->input(x, skb);
 			if (nexthdr == -EINPROGRESS)
-				return 0;
+				return -EINPROGRESS;
 
 			dev_put(skb->dev);
 		}
@@ -693,16 +795,14 @@ resume:
 
 		err = xfrm_inner_mode_input(x, skb);
 		if (err == -EINPROGRESS)
-			return 0;
+			return -EINPROGRESS;
 		else if (err) {
 			XFRM_INC_STATS(net, LINUX_MIB_XFRMINSTATEMODEERROR);
 			goto drop;
 		}
 resume_decapped:
-		if (x->outer_mode.flags & XFRM_MODE_FLAG_TUNNEL) {
-			decaps = 1;
+		if (x->outer_mode.flags & XFRM_MODE_FLAG_TUNNEL)
 			break;
-		}
 
 		/*
 		 * We need the inner address.  However, we only get here for
@@ -716,7 +816,7 @@ resume_decapped:
 			XFRM_INC_STATS(net, LINUX_MIB_XFRMINHDRERROR);
 			goto drop;
 		}
-		crypto_done = false;
+		ctx->crypto_done = false;
 	} while (!err);
 
 	err = xfrm_rcv_cb(skb, family, x->type->proto, 0);
@@ -725,46 +825,15 @@ resume_decapped:
 
 	nf_reset_ct(skb);
 
-	if (decaps) {
-		sp = skb_sec_path(skb);
-		if (sp)
-			sp->olen = 0;
-		if (skb_valid_dst(skb))
-			skb_dst_drop(skb);
-		gro_cells_receive(&gro_cells, skb);
-		return 0;
-	} else {
-		xo = xfrm_offload(skb);
-		if (xo)
-			xfrm_gro = xo->flags & XFRM_GRO;
+	ctx->x = x;
 
-		err = -EAFNOSUPPORT;
-		rcu_read_lock();
-		afinfo = xfrm_state_afinfo_get_rcu(x->props.family);
-		if (likely(afinfo))
-			err = afinfo->transport_finish(skb, xfrm_gro || async);
-		rcu_read_unlock();
-		if (xfrm_gro) {
-			sp = skb_sec_path(skb);
-			if (sp)
-				sp->olen = 0;
-			if (skb_valid_dst(skb))
-				skb_dst_drop(skb);
-			gro_cells_receive(&gro_cells, skb);
-			return err;
-		}
-
-		return err;
-	}
+	return 0;
 
 drop_unlock:
 	spin_unlock(&x->lock);
 drop:
-	xfrm_rcv_cb(skb, family, x && x->type ? x->type->proto : nexthdr, -1);
-	kfree_skb(skb);
-	return 0;
+	return -EINVAL;
 }
-EXPORT_SYMBOL(xfrm_input);
 
 int xfrm_input_resume(struct sk_buff *skb, int nexthdr)
 {
