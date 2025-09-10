@@ -229,8 +229,8 @@ static void esp_output_done(void *data, int err)
 	esp_ssg_unref(x, tmp, skb);
 	kfree(tmp);
 
-	if (XFRM_BULK_SKB_CB(skb)->err)
-		err = XFRM_BULK_SKB_CB(skb)->err;
+//	if (XFRM_BULK_SKB_CB(skb)->err)
+//		err = XFRM_BULK_SKB_CB(skb)->err;
 
 	if (xo && (xo->flags & XFRM_DEV_RESUME)) {
 		if (err) {
@@ -832,7 +832,7 @@ out:
 	return ret;
 }
 
-static int esp_output_list(struct xfrm_state *x, struct list_head *head)
+static int esp_output_list(struct xfrm_state *x, struct list_head *bulk_head)
 {
 	int alen;
 	int blksize;
@@ -843,8 +843,7 @@ static int esp_output_list(struct xfrm_state *x, struct list_head *head)
 	struct sk_buff *skb, *nskb;
 	void *tmp;
 	int ret;
-	bool slowpath = false;
-
+	LIST_HEAD(head);
 	len = 0;
 
 	if (x->props.flags & XFRM_STATE_ESN)
@@ -859,13 +858,9 @@ static int esp_output_list(struct xfrm_state *x, struct list_head *head)
 
 	esp  = esp_tmp_info(tmp);
 
-	list_for_each_entry_safe(skb, nskb, head, list) {
+	list_splice_init(bulk_head, &head);
 
-		if (slowpath) {
-			skb_list_del_init(skb);
-			XFRM_BULK_SKB_CB(skb)->err = esp_output(x, skb);
-			continue;
-		}
+	list_for_each_entry_safe(skb, nskb, &head, list) {
 
 		ESP_SKB_CB(skb)->tmp = tmp;
 
@@ -907,18 +902,12 @@ static int esp_output_list(struct xfrm_state *x, struct list_head *head)
 		skb_push(skb, -skb_network_offset(skb));
 
 		ret = esp_output_tail_list(x, skb, esp, tmp);
-		XFRM_BULK_SKB_CB(skb)->err = ret;
-		if (ret) {
-			if (ret == -EINPROGRESS) {
-				skb_list_del_init(skb);
-				slowpath = true;
+		if (ret == -EINPROGRESS)
 				continue;
-			}
+		else
+			list_add_tail(&skb->list, bulk_head);
 
-			XFRM_BULK_SKB_CB(skb)->err = ret;
-			continue;
-		}
-
+		XFRM_BULK_SKB_CB(skb)->err = ret;
 	}
 
 	kfree(tmp);
@@ -1010,9 +999,15 @@ out:
 
 int esp_input_done2(struct sk_buff *skb, int err)
 {
-	struct xfrm_state *x = xfrm_input_state(skb);
-	struct xfrm_offload *xo = xfrm_offload(skb);
+	struct xfrm_offload *xo;
+	struct xfrm_state *x;
 
+	if (!secpath_exists(skb))
+		x = XFRM_BULK_SKB_CB(skb)->x;
+	else
+		x = xfrm_input_state(skb);
+
+	xo = xfrm_offload(skb);
 	if (!xo || !(xo->flags & CRYPTO_DONE))
 		kfree(ESP_SKB_CB(skb)->tmp);
 
@@ -1158,14 +1153,13 @@ out:
 	return err;
 }
 
-static int esp_input_list(struct xfrm_state *x, struct list_head *head)
+static int esp_input_list(struct xfrm_state *x, struct list_head *bulk_head)
 {
 	struct crypto_aead *aead = x->data;
 	struct sk_buff *skb, *n;
 	struct aead_request *req;
 	struct sk_buff *trailer;
 	int ivlen = crypto_aead_ivsize(aead);
-	bool slowpath = false;
 	int elen;
 	int nfrags = 17; /*XXX*/
 	int assoclen;
@@ -1175,8 +1169,9 @@ static int esp_input_list(struct xfrm_state *x, struct list_head *head)
 	u8 *iv;
 	struct scatterlist *sg;
 	int err = -ENOMEM;
+	LIST_HEAD(head);
 
-	if (list_empty(head))
+	if (list_empty(bulk_head))
 		return 0;
 
 	assoclen = sizeof(struct ip_esp_hdr);
@@ -1189,33 +1184,15 @@ static int esp_input_list(struct xfrm_state *x, struct list_head *head)
 
 	tmp = esp_alloc_tmp(aead, nfrags, seqhilen);
 	if (!tmp) {
-		list_for_each_entry(skb, head, list)
+		list_for_each_entry(skb, bulk_head, list)
 			XFRM_MODE_SKB_CB(skb)->protocol = err;
 		goto out;
 	}
 
-	list_for_each_entry_safe(skb, n, head, list) {
+	list_splice_init(bulk_head, &head);
 
+	list_for_each_entry_safe(skb, n, &head, list) {
 		err = -EINVAL;
-
-		if (slowpath) {
-			if (!secpath_set(skb)) {
-				XFRM_MODE_SKB_CB(skb)->protocol = -ENOMEM;
-				continue;
-			}
-
-			skb_list_del_init(skb);
-			err = esp_input(x, skb);
-			/* Theory of operation: Bottomhalves are off and
-			 * async resumption happens at the same cpu, so
-			 * async resumption can't start until we enable
-			 * bottomhalves again. This means it is save to
-			 * modify the skb after esp_input returned
-			 * -EINPROGRESS. OK?
-			 */
-			XFRM_MODE_SKB_CB(skb)->protocol = err;
-			continue;
-		}
 
 		if (!pskb_may_pull(skb, sizeof(struct ip_esp_hdr) + ivlen)) {
 			XFRM_MODE_SKB_CB(skb)->protocol = err;
@@ -1275,15 +1252,15 @@ skip_cow:
 		aead_request_set_crypt(req, sg, sg, elen + ivlen, iv);
 		aead_request_set_ad(req, assoclen);
 
-		err = crypto_aead_decrypt(req);
-		if (err == -EINPROGRESS) {
-			if (!secpath_set(skb))
-				XFRM_MODE_SKB_CB(skb)->protocol = -ENOMEM;
+		skb_list_del_init(skb);
 
-			skb_list_del_init(skb);
-			slowpath = true;
+		err = crypto_aead_decrypt(req);
+		if (err == -EINPROGRESS)
 			continue;
-		} else if (err < 0) {
+		else
+			list_add_tail(&skb->list, bulk_head);
+
+		if (err < 0) {
 			XFRM_MODE_SKB_CB(skb)->protocol = err;
 			continue;
 		}
@@ -1295,6 +1272,7 @@ skip_cow:
 		XFRM_MODE_SKB_CB(skb)->protocol = err;
 	}
 
+	list_splice_init(&head, bulk_head);
 	kfree(tmp);
 out:
 	return err;
