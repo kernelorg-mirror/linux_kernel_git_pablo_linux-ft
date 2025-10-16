@@ -123,9 +123,12 @@ struct flow_offload_tuple {
 		struct in_addr		dst_v4;
 		struct in6_addr		dst_v6;
 	};
-	struct {
-		__be16			src_port;
-		__be16			dst_port;
+	union {
+		struct {
+			__be16		src_port;
+			__be16		dst_port;
+		};
+		__be32			spi;
 	};
 
 	int				iifidx;
@@ -162,8 +165,13 @@ struct flow_offload_tuple {
 	};
 };
 
+enum flow_offload_flags {
+	FLOW_OFFLOAD_TUNNEL	= (1 << 0),
+};
+
 struct flow_offload_tuple_rhash {
 	struct rhash_head		node;
+	u32				flags;
 	struct flow_offload_tuple	tuple;
 };
 
@@ -185,8 +193,15 @@ enum flow_offload_type {
 	NF_FLOW_OFFLOAD_ROUTE,
 };
 
+struct flow_offload_tunnel {
+	struct flow_offload_tuple_rhash		tuplehash;
+	atomic_t				refcnt;
+	struct rcu_head				rcu_head;
+};
+
 struct flow_offload {
 	struct flow_offload_tuple_rhash		tuplehash[FLOW_OFFLOAD_DIR_MAX];
+	struct flow_offload_tunnel		*tunnel;
 	struct nf_conn				*ct;
 	unsigned long				flags;
 	u16					type;
@@ -228,6 +243,14 @@ struct nf_flow_route {
 
 struct flow_offload *flow_offload_alloc(struct nf_conn *ct);
 void flow_offload_free(struct flow_offload *flow);
+
+int flow_offload_secpath_setup(struct nf_flowtable *flow_table,
+			       struct flow_offload *flow,
+			       const struct sec_path *sp,
+			       struct flow_offload_tunnel **ptunnel);
+int flow_offload_xfrm_setup(struct nf_flowtable *flow_table,
+			    struct flow_offload *flow,
+			    struct flow_offload_tunnel **ptunnel);
 
 static inline int
 nf_flow_table_offload_add_cb(struct nf_flowtable *flow_table,
@@ -286,7 +309,8 @@ nf_flow_table_offload_del_cb(struct nf_flowtable *flow_table,
 void flow_offload_route_init(struct flow_offload *flow,
 			     struct nf_flow_route *route);
 
-int flow_offload_add(struct nf_flowtable *flow_table, struct flow_offload *flow);
+int flow_offload_add(struct nf_flowtable *flow_table, struct flow_offload *flow,
+		     struct flow_offload_tunnel *tunnel);
 void flow_offload_refresh(struct nf_flowtable *flow_table,
 			  struct flow_offload *flow, bool force);
 

@@ -15,6 +15,8 @@
 #include <net/neighbour.h>
 #include <net/netfilter/nf_flow_table.h>
 #include <net/netfilter/nf_conntrack_acct.h>
+#include <net/xfrm.h>
+#include <net/esp.h>
 /* For layer 4 checksum field offset. */
 #include <linux/tcp.h>
 #include <linux/udp.h>
@@ -178,6 +180,7 @@ static int nf_flow_tuple_ip(struct nf_flowtable_ctx *ctx, struct sk_buff *skb,
 			    struct flow_offload_tuple *tuple)
 {
 	struct flow_ports *ports;
+	struct ip_esp_hdr *esph;
 	unsigned int thoff;
 	struct iphdr *iph;
 	u8 ipproto;
@@ -207,6 +210,9 @@ static int nf_flow_tuple_ip(struct nf_flowtable_ctx *ctx, struct sk_buff *skb,
 		ctx->hdrsize = sizeof(struct gre_base_hdr);
 		break;
 #endif
+	case IPPROTO_ESP:
+		ctx->hdrsize = sizeof(struct ip_esp_hdr);
+		break;
 	default:
 		return -1;
 	}
@@ -231,6 +237,10 @@ static int nf_flow_tuple_ip(struct nf_flowtable_ctx *ctx, struct sk_buff *skb,
 		if ((greh->flags & GRE_VERSION) != GRE_VERSION_0)
 			return -1;
 		break;
+	case IPPROTO_ESP:
+		esph = (struct ip_esp_hdr *)(skb_network_header(skb) + thoff);
+		tuple->spi		= esph->spi;
+		break;
 	}
 	}
 
@@ -242,6 +252,19 @@ static int nf_flow_tuple_ip(struct nf_flowtable_ctx *ctx, struct sk_buff *skb,
 	tuple->l4proto		= ipproto;
 	tuple->iifidx		= ctx->in->ifindex;
 	nf_flow_tuple_encap(skb, tuple);
+
+/*
+	if (iph->protocol == IPPROTO_ESP) {
+		pr_info("lookup: %pI4 -> %pI4 l3proto=%u l4proto=%u spi=%x iif=%u\n",
+			&tuple->src_v4, &tuple->dst_v4,
+			tuple->l3proto, tuple->l4proto,
+			tuple->spi, tuple->iifidx);
+	} else {
+		pr_info("lookup: %pI4 -> %pI4 l3proto=%u l4proto=%u iif=%u\n",
+			&tuple->src_v4, &tuple->dst_v4,
+			tuple->l3proto, tuple->l4proto,
+			tuple->iifidx);
+*/
 
 	return 0;
 }
@@ -483,6 +506,85 @@ out:
 	return;
 }
 
+static int nft_esp_bulk_receive(struct list_head *head, struct sk_buff *skb)
+{
+	const struct iphdr *iph;
+	struct sk_buff *p;
+	struct xfrm_state *x;
+	struct sec_path *sp;
+	unsigned int thoff;
+	__be32 daddr;
+	__be32 spi;
+
+	if (xfrm_offload(skb))
+		return -EINVAL;
+
+	iph = ip_hdr(skb);
+	thoff = sizeof(struct iphdr);
+	skb_reset_network_header(skb);
+	skb_set_transport_header(skb, thoff);
+
+	daddr = iph->daddr;
+
+	BUG_ON(iph->protocol != IPPROTO_ESP);
+
+	spi = ip_esp_hdr(skb)->spi;
+
+	XFRM_SPI_SKB_CB(skb)->family = AF_INET;
+	XFRM_SPI_SKB_CB(skb)->daddroff = offsetof(struct iphdr, daddr);
+	XFRM_SPI_SKB_CB(skb)->seq = ip_esp_hdr(skb)->seq_no;
+	XFRM_SPI_SKB_CB(skb)->spi = spi;
+
+	list_for_each_entry(p, head, list) {
+
+		if (p->protocol != htons(ETH_P_IP))
+			continue;
+
+		if (daddr != ip_hdr(p)->daddr) {
+			continue;
+		}
+
+		if (spi != ip_esp_hdr(p)->spi) {
+			continue;
+		}
+
+		goto found;
+	}
+
+	goto out;
+
+found:
+	if (NFT_BULK_CB(p)->last == p)
+		skb_shinfo(p)->frag_list = skb;
+	else
+		NFT_BULK_CB(p)->last->next = skb;
+
+	NFT_BULK_CB(p)->last = skb;
+	skb_pull(skb, sizeof(*iph));
+
+	return 0;
+out:
+	/* First skb */
+	x = xfrm_state_lookup(dev_net(skb->dev), skb->mark,
+			(xfrm_address_t *)&daddr,
+			spi, IPPROTO_ESP, AF_INET);
+	if (!x)
+		return -ENOENT;
+
+	sp = secpath_set(skb);
+	if (!sp)
+		return -ENOMEM;
+
+	NFT_BULK_CB(skb)->last = skb;
+	list_add_tail(&skb->list, head);
+
+	sp->xvec[sp->len++] = x;
+	skb_pull(skb, sizeof(*iph));
+	skb->priority = rt_tos2priority(iph->tos);
+
+	return 0;
+}
+
 static void nf_flow_neigh_xmit_list(struct sk_buff *skb, struct net_device *outdev, const void *daddr)
 {
 	struct sk_buff *iter = skb->next;
@@ -531,6 +633,7 @@ void __nf_flow_offload_ip_hook_list(void *priv, struct list_head *head,
 	LIST_HEAD(bulk_head);
 	LIST_HEAD(bulk_list);
 	LIST_HEAD(acc_list);
+	LIST_HEAD(esp_list);
 	struct rtable *rt;
 	int ret;
 
@@ -543,6 +646,14 @@ void __nf_flow_offload_ip_hook_list(void *priv, struct list_head *head,
 		tuplehash = nf_flow_offload_lookup(&ctx, flow_table, skb);
 		if (!tuplehash) {
 			list_add_tail(&skb->list, &acc_list);
+			continue;
+		}
+
+		if (tuplehash->flags & FLOW_OFFLOAD_TUNNEL) {
+			/* nf_flow_encap_pop() and set transport header. */
+			skb_dst_set_noref(skb, tuplehash->tuple.dst_cache);
+			memset(skb->cb, 0, sizeof(struct nft_bulk_cb));
+			list_add_tail(&skb->list, &esp_list);
 			continue;
 		}
 
@@ -562,6 +673,27 @@ void __nf_flow_offload_ip_hook_list(void *priv, struct list_head *head,
 		list_add_tail(&skb->list, &bulk_list);
 	}
 
+	list_for_each_entry_safe(skb, n, &esp_list, list) {
+		skb_list_del_init(skb);
+		memset(skb->cb, 0, sizeof(struct nft_bulk_cb));
+		ret = nft_esp_bulk_receive(&bulk_head, skb);
+		if (ret)
+			list_add_tail(&skb->list, &acc_list);
+	}
+
+	list_for_each_entry_safe(skb, n, &bulk_head, list) {
+
+		list_del_init(&skb->list);
+
+		skb->next = skb_shinfo(skb)->frag_list;
+		skb_shinfo(skb)->frag_list = NULL;
+
+		ret = xfrm_input_list(&skb, IPPROTO_ESP);
+		/* Returns always 0 */
+	}
+
+	/*XXX: fwd policy check */
+
 	list_splice_init(&acc_list, head);
 
 	list_for_each_entry_safe(skb, n, &bulk_list, list) {
@@ -578,6 +710,13 @@ void __nf_flow_offload_ip_hook_list(void *priv, struct list_head *head,
 
 		tuplehash = NFT_BULK_CB(skb)->tuplehash;
 		skb_dst_set_noref(skb, tuplehash->tuple.dst_cache);
+
+		if (skb_dst(skb)->xfrm) {
+			skb = xfrm_output_list(skb);
+			if (!skb)
+				continue;
+		}
+
 		rt = (struct rtable *)skb_dst(skb);
 
 		neigh = ip_neigh_gw4(rt->dst.dev, rt_nexthop(rt, ip_hdr(skb)->daddr));

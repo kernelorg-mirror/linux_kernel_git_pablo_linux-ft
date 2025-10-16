@@ -6,6 +6,7 @@
 #include <linux/rhashtable.h>
 #include <linux/netdevice.h>
 #include <net/ip.h>
+#include <net/xfrm.h>
 #include <net/ip6_route.h>
 #include <net/netfilter/nf_tables.h>
 #include <net/netfilter/nf_flow_table.h>
@@ -283,6 +284,15 @@ static int flow_offload_hash_cmp(struct rhashtable_compare_arg *arg,
 	const struct flow_offload_tuple *tuple = arg->key;
 	const struct flow_offload_tuple_rhash *x = ptr;
 
+/*	pr_info("cmp %pI4 -> %pI4 l3proto=%u l4proto=%u spi:%x iifidx=%d\n",
+		&x->tuple.src_v4, &x->tuple.dst_v4,
+		x->tuple.l3proto, x->tuple.l4proto,
+		x->tuple.spi, x->tuple.iifidx);
+	pr_info("cmp %pI4 -> %pI4 l3proto=%u l4proto=%u spi:%x iifidx=%d\n",
+		&tuple->src_v4, &tuple->dst_v4,
+		tuple->l3proto, tuple->l4proto,
+		tuple->spi, tuple->iifidx); */
+
 	if (memcmp(&x->tuple, tuple, offsetof(struct flow_offload_tuple, __hash)))
 		return 1;
 
@@ -316,27 +326,37 @@ unsigned long flow_offload_get_timeout(struct flow_offload *flow)
 	return timeout;
 }
 
-int flow_offload_add(struct nf_flowtable *flow_table, struct flow_offload *flow)
+static void flow_offload_tunnel_free(struct nf_flowtable *flow_table,
+				     struct flow_offload *flow)
+{
+	if (flow->tunnel && atomic_dec_and_test(&flow->tunnel->refcnt)) {
+		dst_release(flow->tunnel->tuplehash.tuple.dst_cache);
+		rhashtable_remove_fast(&flow_table->rhashtable,
+				       &flow->tunnel->tuplehash.node,
+				       nf_flow_offload_rhash_params);
+		kfree_rcu(flow->tunnel, rcu_head);
+	}
+}
+
+int flow_offload_add(struct nf_flowtable *flow_table, struct flow_offload *flow,
+		     struct flow_offload_tunnel *tunnel)
 {
 	int err;
 
+	flow->tunnel = tunnel;
 	flow->timeout = nf_flowtable_time_stamp + flow_offload_get_timeout(flow);
 
 	err = rhashtable_insert_fast(&flow_table->rhashtable,
 				     &flow->tuplehash[0].node,
 				     nf_flow_offload_rhash_params);
 	if (err < 0)
-		return err;
+		goto err_orig_tuple;
 
 	err = rhashtable_insert_fast(&flow_table->rhashtable,
 				     &flow->tuplehash[1].node,
 				     nf_flow_offload_rhash_params);
-	if (err < 0) {
-		rhashtable_remove_fast(&flow_table->rhashtable,
-				       &flow->tuplehash[0].node,
-				       nf_flow_offload_rhash_params);
-		return err;
-	}
+	if (err < 0)
+		goto err_reply_tuple;
 
 	nf_ct_refresh(flow->ct, NF_CT_DAY);
 
@@ -346,6 +366,16 @@ int flow_offload_add(struct nf_flowtable *flow_table, struct flow_offload *flow)
 	}
 
 	return 0;
+
+err_reply_tuple:
+	rhashtable_remove_fast(&flow_table->rhashtable,
+			       &flow->tuplehash[0].node,
+			       nf_flow_offload_rhash_params);
+err_orig_tuple:
+	flow_offload_tunnel_free(flow_table, flow);
+	flow->tunnel = NULL;
+
+	return err;
 }
 EXPORT_SYMBOL_GPL(flow_offload_add);
 
@@ -377,6 +407,7 @@ static void flow_offload_del(struct nf_flowtable *flow_table,
 	rhashtable_remove_fast(&flow_table->rhashtable,
 			       &flow->tuplehash[FLOW_OFFLOAD_DIR_REPLY].node,
 			       nf_flow_offload_rhash_params);
+	flow_offload_tunnel_free(flow_table, flow);
 	flow_offload_free(flow);
 }
 
@@ -400,6 +431,9 @@ flow_offload_lookup(struct nf_flowtable *flow_table,
 				      nf_flow_offload_rhash_params);
 	if (!tuplehash)
 		return NULL;
+
+	if (tuplehash->flags & FLOW_OFFLOAD_TUNNEL)
+		return tuplehash;
 
 	dir = tuplehash->tuple.dir;
 	flow = container_of(tuplehash, struct flow_offload, tuplehash[dir]);
@@ -436,6 +470,8 @@ nf_flow_table_iterate(struct nf_flowtable *flow_table,
 			continue;
 		}
 		if (tuplehash->tuple.dir)
+			continue;
+		if (tuplehash->flags & FLOW_OFFLOAD_TUNNEL)
 			continue;
 
 		flow = container_of(tuplehash, struct flow_offload, tuplehash[0]);
@@ -684,6 +720,210 @@ void nf_flow_dnat_port(const struct flow_offload *flow, struct sk_buff *skb,
 	nf_flow_nat_port(skb, thoff, protocol, port, new_port);
 }
 EXPORT_SYMBOL_GPL(nf_flow_dnat_port);
+
+int flow_offload_secpath_setup(struct nf_flowtable *flow_table,
+			       struct flow_offload *flow,
+			       const struct sec_path *sp,
+			       struct flow_offload_tunnel **ptunnel)
+{
+	struct flow_offload_tuple_rhash *tuplehash;
+	struct flow_offload_tuple flow_tuple = {};
+	struct dst_entry *secpath_dst = NULL;
+	struct flow_offload_tunnel *tunnel;
+	struct dst_entry *other_dst = NULL;
+	struct xfrm_state *x = sp->xvec[0];
+	struct net *net = xs_net(x);
+	struct flowi fl;
+	int err, iif;
+
+	pr_info("nf_flow_secpath_setup\n");
+
+	memset(&fl, 0, sizeof(fl));
+	switch (x->props.family) {
+	case AF_INET:
+		fl.u.ip4.daddr = x->props.saddr.a4;
+		break;
+	case AF_INET6:
+		fl.u.ip6.daddr = x->props.saddr.in6;
+		break;
+	}
+
+	nf_route(net, &other_dst, &fl, false, x->props.family);
+	if (!other_dst) {
+		pr_info("cannot find route for %pI4\n", &fl.u.ip4.daddr);
+		return -ENOENT;
+	}
+
+	iif = other_dst->dev->ifindex;
+	dst_release(other_dst);
+
+	switch (x->props.family) {
+	case NFPROTO_IPV4:
+		flow_tuple.src_v4.s_addr = x->props.saddr.a4;
+		flow_tuple.dst_v4.s_addr = x->id.daddr.a4;
+		break;
+	case NFPROTO_IPV6:
+		flow_tuple.src_v6 = x->props.saddr.in6;
+		flow_tuple.dst_v6 = x->id.daddr.in6;
+		break;
+	}
+
+	flow_tuple.spi = x->id.spi;
+	flow_tuple.l3proto = x->props.family;
+	flow_tuple.l4proto = x->id.proto;
+	flow_tuple.iifidx = iif;
+
+	tuplehash = rhashtable_lookup(&flow_table->rhashtable,
+				      &flow_tuple, nf_flow_offload_rhash_params);
+	if (!tuplehash) {
+		memset(&fl, 0, sizeof(fl));
+		switch (x->props.family) {
+		case AF_INET:
+			fl.u.ip4.daddr = x->id.daddr.a4;
+			break;
+		case AF_INET6:
+			fl.u.ip6.daddr = x->id.daddr.in6;
+			break;
+		}
+
+		nf_route(net, &secpath_dst, &fl, false, x->props.family);
+		if (!secpath_dst) {
+			pr_info("cannot find route for %pI4\n", &fl.u.ip4.daddr);
+			return -ENOENT;
+		}
+
+		tunnel = kzalloc(sizeof(*tunnel), GFP_ATOMIC);
+		if (!tunnel) {
+			dst_release(secpath_dst);
+			return -ENOMEM;
+		}
+
+		tunnel->tuplehash.tuple = flow_tuple;
+		tunnel->tuplehash.flags |= FLOW_OFFLOAD_TUNNEL;
+		atomic_set(&tunnel->refcnt, 1);
+		tunnel->tuplehash.tuple.dst_cache = secpath_dst;
+
+		err = rhashtable_insert_fast(&flow_table->rhashtable,
+					     &tunnel->tuplehash.node,
+					     nf_flow_offload_rhash_params);
+		if (err < 0) {
+			dst_release(secpath_dst);
+			kfree(tunnel);
+			return err;
+		}
+		pr_info("adding new tunnel tuple\n");
+	} else {
+		tunnel = container_of(tuplehash, struct flow_offload_tunnel, tuplehash);
+
+		if (!atomic_inc_not_zero(&tunnel->refcnt))
+			return -EAGAIN;
+	}
+
+	*ptunnel = tunnel;
+
+	pr_info("tunnel %pI4 -> %pI4 l3proto=%u l4proto=%u spi:%x iifidx=%d\n",
+		&flow_tuple.src_v4, &flow_tuple.dst_v4,
+		flow_tuple.l3proto, flow_tuple.l4proto,
+		flow_tuple.spi, flow_tuple.iifidx);
+
+	return 0;
+}
+EXPORT_SYMBOL_GPL(flow_offload_secpath_setup);
+
+int flow_offload_xfrm_setup(struct nf_flowtable *flow_table,
+			    struct flow_offload *flow,
+			    struct flow_offload_tunnel **ptunnel)
+{
+	struct flow_offload_tuple_rhash *tuplehash;
+	struct flow_offload_tuple flow_tuple = {};
+	struct dst_entry *other_dst = NULL, *dst;
+	struct flow_offload_tunnel *tunnel;
+	struct xfrm_state *x, *reverse_x;
+	struct net *net;
+	struct flowi fl;
+	int err, iif;
+
+	dst = flow->tuplehash[0].tuple.dst_cache;
+	if (WARN_ON_ONCE(!dst->xfrm))
+		return -EINVAL;
+
+	x = dst->xfrm;
+	net = xs_net(x);
+
+	memset(&fl, 0, sizeof(fl));
+	switch (x->props.family) {
+	case AF_INET:
+		fl.u.ip4.daddr = x->id.daddr.a4;
+		break;
+	case AF_INET6:
+		fl.u.ip6.daddr = x->id.daddr.in6;
+		break;
+	}
+
+	nf_route(net, &other_dst, &fl, false, x->props.family);
+	if (!other_dst)
+		return -ENOENT;
+
+	iif = other_dst->dev->ifindex;
+
+	reverse_x = xfrm_state_lookup_byaddr(net, 0, &x->props.saddr,
+					     &x->id.daddr, x->id.proto,
+					     x->props.family);
+	if (!reverse_x) {
+		dst_release(other_dst);
+		return -ENOENT;
+	}
+
+	switch (x->props.family) {
+	case NFPROTO_IPV4:
+		flow_tuple.src_v4.s_addr = reverse_x->props.saddr.a4;
+		flow_tuple.dst_v4.s_addr = reverse_x->id.daddr.a4;
+		break;
+	case NFPROTO_IPV6:
+		flow_tuple.src_v6 = reverse_x->props.saddr.in6;
+		flow_tuple.dst_v6 = reverse_x->id.daddr.in6;
+		break;
+	}
+
+	flow_tuple.spi = reverse_x->id.spi;
+	flow_tuple.l3proto = reverse_x->props.family;
+	flow_tuple.l4proto = reverse_x->id.proto;
+	flow_tuple.iifidx = iif;
+
+	tuplehash = rhashtable_lookup(&flow_table->rhashtable,
+				      &flow_tuple, nf_flow_offload_rhash_params);
+	if (!tuplehash) {
+		tunnel = kzalloc(sizeof(*tunnel), GFP_ATOMIC);
+		if (!tunnel) {
+			dst_release(other_dst);
+			return -ENOMEM;
+		}
+
+		tunnel->tuplehash.tuple = flow_tuple;
+		tunnel->tuplehash.flags |= FLOW_OFFLOAD_TUNNEL;
+		atomic_set(&tunnel->refcnt, 1);
+		tunnel->tuplehash.tuple.dst_cache = other_dst;
+
+		err = rhashtable_insert_fast(&flow_table->rhashtable,
+					     &tunnel->tuplehash.node,
+					     nf_flow_offload_rhash_params);
+		if (err < 0) {
+			dst_release(other_dst);
+			kfree(tunnel);
+			return err;
+		}
+	} else {
+		dst_release(other_dst);
+
+		tunnel = container_of(tuplehash, struct flow_offload_tunnel, tuplehash);
+
+		if (!atomic_inc_not_zero(&tunnel->refcnt))
+			return -EAGAIN;
+	}
+
+	return 0;
+}
+EXPORT_SYMBOL_GPL(flow_offload_xfrm_setup);
 
 int nf_flow_table_init(struct nf_flowtable *flowtable)
 {

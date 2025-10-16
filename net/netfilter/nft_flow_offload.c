@@ -15,6 +15,7 @@
 #include <net/netfilter/nf_conntrack_core.h>
 #include <net/netfilter/nf_conntrack_extend.h>
 #include <net/netfilter/nf_flow_table.h>
+#include <net/xfrm.h>
 
 struct nft_flow_offload {
 	struct nft_flowtable	*flowtable;
@@ -272,9 +273,18 @@ static int nft_flow_route(const struct nft_pktinfo *pkt,
 	return 0;
 }
 
-static bool nft_flow_offload_skip(struct sk_buff *skb, int family)
+static bool nft_flow_offload_secpath_skip(const struct sec_path *sp)
 {
-	if (skb_sec_path(skb))
+	if (sp && sp->len != 1)
+		return true;
+
+	return false;
+}
+
+static bool nft_flow_offload_skip(struct sk_buff *skb, int family,
+				  const struct sec_path *sp)
+{
+	if (nft_flow_offload_secpath_skip(sp))
 		return true;
 
 	if (family == NFPROTO_IPV4) {
@@ -298,12 +308,22 @@ static void flow_offload_ct_tcp(struct nf_conn *ct)
 	spin_unlock_bh(&ct->lock);
 }
 
+static bool nft_flow_offload_secpath(const struct sec_path *sp)
+{
+	if (!sp || sp->len != 1)
+		return false;
+
+	return true;
+}
+
 static void nft_flow_offload_eval(const struct nft_expr *expr,
 				  struct nft_regs *regs,
 				  const struct nft_pktinfo *pkt)
 {
 	struct nft_flow_offload *priv = nft_expr_priv(expr);
 	struct nf_flowtable *flowtable = &priv->flowtable->data;
+	struct sec_path *sp = skb_sec_path(pkt->skb);
+	struct flow_offload_tunnel *tunnel = NULL;
 	struct tcphdr _tcph, *tcph = NULL;
 	struct nf_flow_route route = {};
 	enum ip_conntrack_info ctinfo;
@@ -312,7 +332,7 @@ static void nft_flow_offload_eval(const struct nft_expr *expr,
 	struct nf_conn *ct;
 	int ret;
 
-	if (nft_flow_offload_skip(pkt->skb, nft_pf(pkt)))
+	if (nft_flow_offload_skip(pkt->skb, nft_pf(pkt), sp))
 		goto out;
 
 	ct = nf_ct_get(pkt->skb, &ctinfo);
@@ -368,8 +388,20 @@ static void nft_flow_offload_eval(const struct nft_expr *expr,
 	if (tcph)
 		flow_offload_ct_tcp(ct);
 
+	if (tcph) {
+		ct->proto.tcp.seen[0].flags |= IP_CT_TCP_FLAG_BE_LIBERAL;
+		ct->proto.tcp.seen[1].flags |= IP_CT_TCP_FLAG_BE_LIBERAL;
+	}
+
+	if (nft_flow_offload_secpath(sp) &&
+	    flow_offload_secpath_setup(flowtable, flow, sp, &tunnel) < 0)
+		goto err_flow_add;
+	else if (flow->tuplehash[0].tuple.xmit_type == FLOW_OFFLOAD_XMIT_XFRM &&
+		 flow_offload_xfrm_setup(flowtable, flow, &tunnel) < 0)
+		goto err_flow_add;
+
 	__set_bit(NF_FLOW_HW_BIDIRECTIONAL, &flow->flags);
-	ret = flow_offload_add(flowtable, flow);
+	ret = flow_offload_add(flowtable, flow, tunnel);
 	if (ret < 0)
 		goto err_flow_add;
 
