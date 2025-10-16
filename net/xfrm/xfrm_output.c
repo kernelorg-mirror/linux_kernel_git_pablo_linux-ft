@@ -57,6 +57,14 @@ static struct dst_entry *skb_dst_pop(struct sk_buff *skb)
 	return child;
 }
 
+static struct dst_entry *skb_dst_pop_noref(struct sk_buff *skb)
+{
+	struct dst_entry *child = xfrm_dst_child(skb_dst(skb));
+
+	skb_dst_drop(skb);
+	return child;
+}
+
 /* Add encapsulation header.
  *
  * The IP header will be moved forward to make space for the encapsulation
@@ -533,22 +541,23 @@ static int xfrm_output_one(struct sk_buff *skb, int err)
 			goto error;
 		}
 
+		/* FIXME: Only first packet counted on nft bulk! */
 		x->curlft.bytes += skb->len;
 		x->curlft.packets++;
 		x->lastused = ktime_get_real_seconds();
 
 		spin_unlock_bh(&x->lock);
 
-		skb_dst_force(skb);
-		if (!skb_dst(skb)) {
-			XFRM_INC_STATS(net, LINUX_MIB_XFRMOUTERROR);
-			err = -EHOSTUNREACH;
-			goto error_nolock;
-		}
-
 		if (xfrm_offload(skb)) {
 			x->type_offload->encap(x, skb);
 		} else {
+			skb_dst_force(skb);
+			if (!skb_dst(skb)) {
+				XFRM_INC_STATS(net, LINUX_MIB_XFRMOUTERROR);
+				err = -EHOSTUNREACH;
+				goto error_nolock;
+			}
+
 			/* Inner headers are invalid now. */
 			skb->encapsulation = 0;
 
@@ -826,6 +835,153 @@ out:
 	return xfrm_output2(net, sk, skb);
 }
 EXPORT_SYMBOL_GPL(xfrm_output);
+
+struct sk_buff *xfrm_output_list(struct sk_buff *skb)
+{
+	struct net *net = dev_net(skb_dst(skb)->dev);
+	struct xfrm_state *x = skb_dst(skb)->xfrm;
+	struct sk_buff *head_skb = NULL, *nskb;
+	struct list_head head;
+	struct dst_entry *dst;
+	struct sk_buff *iter;
+	struct ipv6hdr *ip6h;
+	struct iphdr *iph;
+	int err;
+
+	if (unlikely(x->km.state != XFRM_STATE_VALID)) {
+		XFRM_INC_STATS(net, LINUX_MIB_XFRMOUTSTATEINVALID);
+		goto error;
+	}
+
+	err = xfrm_state_check_expire(x);
+	if (err) {
+		XFRM_INC_STATS(net, LINUX_MIB_XFRMOUTSTATEEXPIRED);
+		goto error;
+	}
+
+	INIT_LIST_HEAD(&head);
+	skb_list_walk_safe(skb, iter, nskb) {
+		skb_mark_not_on_list(iter);
+
+		xfrm_get_inner_ipproto(iter, x);
+		iter->encapsulation = 1;
+
+		if (iter->ip_summed == CHECKSUM_PARTIAL) {
+			err = skb_checksum_help(iter);
+			if (err) {
+				XFRM_INC_STATS(net, LINUX_MIB_XFRMOUTERROR);
+				kfree_skb(iter);
+				continue;
+			}
+		}
+
+		err = xfrm_skb_check_space(iter);
+		if (err) {
+			XFRM_INC_STATS(net, LINUX_MIB_XFRMOUTERROR);
+			kfree_skb(iter);
+			continue;
+		}
+
+		iter->mark = xfrm_smark_get(iter->mark, x);
+
+		err = xfrm_outer_mode_output(x, iter);
+		if (err) {
+			XFRM_INC_STATS(net, LINUX_MIB_XFRMOUTSTATEMODEERROR);
+			kfree_skb(iter);
+			continue;
+		}
+
+		spin_lock(&x->lock);
+		err = xfrm_replay_overflow(x, iter);
+		if (err) {
+			XFRM_INC_STATS(net, LINUX_MIB_XFRMOUTSTATESEQERROR);
+			kfree_skb(iter);
+			spin_unlock(&x->lock);
+			continue;
+		}
+
+		x->curlft.bytes += iter->len;
+		x->curlft.packets++;
+
+		spin_unlock(&x->lock);
+
+		/* Inner headers are invalid now. */
+		iter->encapsulation = 0;
+
+		XFRM_BULK_SKB_CB(iter)->err = 0;
+
+		list_add_tail(&iter->list, &head);
+	}
+
+	err = x->type->output_list(x, &head);
+
+	iter = NULL;
+
+	list_for_each_entry_safe(skb, nskb, &head, list) {
+
+		skb_list_del_init(skb);
+
+		if (XFRM_BULK_SKB_CB(skb)->err) {
+
+			if (XFRM_BULK_SKB_CB(skb)->err == -EINPROGRESS) {
+
+				/* Theory of operation: This is exclusively used in
+				 * the forwarding path, so BHs are off and async crypto
+				 * resumption can't happen before BHs are enabled. This
+				 * means that we can still modify the skb. OK?
+				 */
+				skb_dst_force(skb);
+				if (!skb_dst(skb)) {
+					/* skb leak here? */
+					XFRM_BULK_SKB_CB(skb)->err = -ENOMEM;
+					continue;
+				}
+
+				XFRM_BULK_SKB_CB(skb)->err = 0;
+				continue;
+			} else {
+				XFRM_INC_STATS(net, LINUX_MIB_XFRMOUTERROR);
+				kfree_skb(skb);
+				continue;
+			}
+		}
+
+		dst = skb_dst_pop_noref(skb);
+		if (!dst) {
+			XFRM_INC_STATS(net, LINUX_MIB_XFRMOUTERROR);
+			kfree_skb(skb);
+			continue;
+		}
+		skb_dst_set_noref(skb, dst);
+
+		switch (x->outer_mode.family) {
+		case AF_INET:
+			iph = ip_hdr(skb);
+			iph->tot_len = htons(skb->len);
+			ip_send_check(iph);
+			IPCB(skb)->flags = IPSKB_XFRM_TRANSFORMED;
+			break;
+		case AF_INET6:
+			ip6h = ipv6_hdr(skb);
+			ip6h->payload_len = htons(skb->len - sizeof(struct ipv6hdr));
+			IP6CB(skb)->flags = IP6SKB_XFRM_TRANSFORMED;
+			break;
+		}
+
+		if (!head_skb)
+			head_skb = skb;
+		else
+			iter->next = skb;
+
+		iter = skb;
+	}
+
+	return head_skb;
+error:
+	kfree_skb_list(skb);
+	return NULL;
+}
+EXPORT_SYMBOL_GPL(xfrm_output_list);
 
 int xfrm4_tunnel_check_size(struct sk_buff *skb)
 {

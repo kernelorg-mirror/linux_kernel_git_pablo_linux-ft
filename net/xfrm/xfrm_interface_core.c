@@ -367,7 +367,10 @@ static int xfrmi_rcv_cb(struct sk_buff *skb, int err)
 	if (err && !secpath_exists(skb))
 		return 0;
 
-	x = xfrm_input_state(skb);
+	if (!secpath_exists(skb))
+		x = XFRM_BULK_SKB_CB(skb)->x;
+	else
+		x = xfrm_input_state(skb);
 
 	xi = xfrmi_lookup(xs_net(x), x);
 	if (!xi)

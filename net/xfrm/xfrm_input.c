@@ -634,6 +634,98 @@ drop:
 }
 EXPORT_SYMBOL(xfrm_input);
 
+int xfrm_input_list(struct sk_buff **skbp, int nexthdr)
+{
+	struct sk_buff *skb = *skbp;
+	struct net *net = dev_net(skb->dev);
+	struct sk_buff *skb2, *nskb;
+	struct xfrm_input_ctx ctx = {
+		.net		= net,
+		.nexthdr	= nexthdr,
+	};
+	struct xfrm_state *x = NULL;
+	struct list_head head;
+	unsigned int family;
+	struct sec_path *sp;
+	__be32 seq;
+	int err;
+
+	x = xfrm_input_state(skb);
+
+	if (unlikely(x->km.state != XFRM_STATE_VALID)) {
+		if (x->km.state == XFRM_STATE_ACQ)
+			XFRM_INC_STATS(net, LINUX_MIB_XFRMACQUIREERROR);
+		else
+			XFRM_INC_STATS(net, LINUX_MIB_XFRMINSTATEINVALID);
+
+		goto drop;
+	}
+
+	family = x->outer_mode.family;
+	seq = XFRM_SKB_CB(skb)->seq.input.low;
+
+	ctx.x = x;
+	ctx.spi = x->id.spi;
+
+	INIT_LIST_HEAD(&head);
+	skb_list_walk_safe(skb, skb2, nskb) {
+
+		skb_mark_not_on_list(skb2);
+
+		err = xfrm_input_loop(&ctx, skb2, -3);
+		if (err) {
+			xfrm_rcv_cb(skb2, family, x && x->type ? x->type->proto : nexthdr, -1);
+			kfree_skb(skb2);
+			continue;
+		}
+
+		list_add_tail(&skb2->list, &head);
+	}
+
+	x->type->input_list(x, &head);
+
+	if (list_empty(&head))
+		return 0;
+
+	list_for_each_entry_safe(skb, nskb, &head, list) {
+		nexthdr = XFRM_MODE_SKB_CB(skb)->protocol;
+		ctx.nexthdr = nexthdr;
+
+		XFRM_BULK_SKB_CB(skb)->x = x;
+
+		dev_hold(skb->dev);
+
+		err = xfrm_input_loop(&ctx, skb, -1);
+		if (err) {
+			skb_list_del_init(skb);
+			if (err == -EINPROGRESS)
+				continue;
+
+			xfrm_rcv_cb(skb, family, x && x->type ? x->type->proto : nexthdr, -1);
+			kfree_skb(skb);
+			continue;
+		}
+
+		/* XXX: after adjusting xfrm_input() to use _loop(), for _TUNNEL. */
+		sp = skb_sec_path(skb);
+		if (sp)
+			sp->olen = 0;
+		if (skb_valid_dst(skb))
+			skb_dst_drop(skb);
+	}
+
+	/* XXX: Recursive call! */
+	netif_receive_skb_list(&head);
+	return 0;
+
+drop:
+	skb_list_walk_safe(skb, skb2, nskb)
+		xfrm_rcv_cb(skb2, family, x && x->type ? x->type->proto : nexthdr, -1);
+	kfree_skb_list(skb);
+	return 0;
+}
+EXPORT_SYMBOL(xfrm_input_list);
+
 static int xfrm_input_loop(struct xfrm_input_ctx *ctx, struct sk_buff *skb,
 			   int encap_type)
 {
@@ -647,6 +739,7 @@ static int xfrm_input_loop(struct xfrm_input_ctx *ctx, struct sk_buff *skb,
 	unsigned int family;
 	struct sec_path *sp;
 	__be32 seq_hi, seq;
+	bool bulk = false;
 	int err = 0;
 
 	/* An encap_type of -2 indicates reconstructed inner packet */
@@ -666,8 +759,12 @@ static int xfrm_input_loop(struct xfrm_input_ctx *ctx, struct sk_buff *skb,
 
 	seq = XFRM_SPI_SKB_CB(skb)->seq;
 
-	if (xo && (xo->flags & XFRM_GRO || encap_type == 0 || encap_type == UDP_ENCAP_ESPINUDP)) {
+	if (encap_type < 0 || (xo && (xo->flags & XFRM_GRO || encap_type == 0 || encap_type == UDP_ENCAP_ESPINUDP))) {
 		family = x->outer_mode.family;
+		if (encap_type == -3) {
+			bulk = true;
+			encap_type = 0;
+		}
 		goto lock;
 	}
 
@@ -751,6 +848,9 @@ lock:
 
 		XFRM_SKB_CB(skb)->seq.input.low = seq;
 		XFRM_SKB_CB(skb)->seq.input.hi = seq_hi;
+
+		if (bulk)
+			return 0;
 
 		if (ctx->crypto_done) {
 			nexthdr = x->type_offload->input_tail(x, skb);
