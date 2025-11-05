@@ -42,6 +42,82 @@ nf_flow_offload_inet_hook(void *priv, struct sk_buff *skb,
 	return NF_ACCEPT;
 }
 
+static unsigned int
+__nf_flow_offload_hook_list(void *priv, struct sk_buff *unused,
+			    const struct nf_hook_state *state, u32 flags)
+{
+	struct list_head *skb_list = state->skb_list;
+	struct sk_buff *skb, *next;
+	struct vlan_ethhdr *veth;
+	LIST_HEAD(skb_ipv4_list);
+	LIST_HEAD(skb_ipv6_list);
+	__be16 proto;
+
+	list_for_each_entry_safe(skb, next, skb_list, list) {
+		skb_reset_network_header(skb);
+		if (!skb_transport_header_was_set(skb))
+			skb_reset_transport_header(skb);
+		skb_reset_mac_len(skb);
+
+		switch (skb->protocol) {
+		case htons(ETH_P_8021Q):
+			veth = (struct vlan_ethhdr *)skb_mac_header(skb);
+			proto = veth->h_vlan_encapsulated_proto;
+			break;
+		case htons(ETH_P_PPP_SES):
+			nf_flow_pppoe_proto(skb, &proto);
+			break;
+		default:
+			proto = skb->protocol;
+			break;
+		}
+
+		switch (proto) {
+		case htons(ETH_P_IP):
+			list_move_tail(&skb->list, &skb_ipv4_list);
+			break;
+		case htons(ETH_P_IPV6):
+			list_move_tail(&skb->list, &skb_ipv6_list);
+			break;
+		}
+	}
+
+	if (flags & (1 << NFPROTO_IPV4) && !list_empty(&skb_ipv4_list))
+		__nf_flow_offload_ip_hook_list(priv, &skb_ipv4_list, state->in);
+
+	list_splice_tail(&skb_ipv4_list, skb_list);
+	list_splice_tail(&skb_ipv6_list, skb_list);
+
+	if (!list_empty(skb_list))
+		return NF_ACCEPT;
+
+	return NF_STOLEN;
+}
+
+static unsigned int
+nf_flow_offload_ip_hook_list(void *priv, struct sk_buff *unused,
+			     const struct nf_hook_state *state)
+{
+	return __nf_flow_offload_hook_list(priv, unused, state,
+					   1 << NFPROTO_IPV4);
+}
+
+static unsigned int
+nf_flow_offload_ipv6_hook_list(void *priv, struct sk_buff *unused,
+				 const struct nf_hook_state *state)
+{
+	return __nf_flow_offload_hook_list(priv, unused, state,
+					   1 << NFPROTO_IPV6);
+}
+
+static unsigned int
+nf_flow_offload_inet_hook_list(void *priv, struct sk_buff *unused,
+			       const struct nf_hook_state *state)
+{
+	return __nf_flow_offload_hook_list(priv, unused, state,
+					   (1 << NFPROTO_IPV4) | (1 << NFPROTO_IPV6));
+}
+
 static int nf_flow_rule_route_inet(struct net *net,
 				   struct flow_offload *flow,
 				   enum flow_offload_tuple_dir dir,
@@ -72,6 +148,7 @@ static struct nf_flowtable_type flowtable_inet = {
 	.action		= nf_flow_rule_route_inet,
 	.free		= nf_flow_table_free,
 	.hook		= nf_flow_offload_inet_hook,
+	.hook_list	= nf_flow_offload_inet_hook_list,
 	.owner		= THIS_MODULE,
 };
 
@@ -82,6 +159,7 @@ static struct nf_flowtable_type flowtable_ipv4 = {
 	.action		= nf_flow_rule_route_ipv4,
 	.free		= nf_flow_table_free,
 	.hook		= nf_flow_offload_ip_hook,
+	.hook_list	= nf_flow_offload_ip_hook_list,
 	.owner		= THIS_MODULE,
 };
 
@@ -92,6 +170,7 @@ static struct nf_flowtable_type flowtable_ipv6 = {
 	.action		= nf_flow_rule_route_ipv6,
 	.free		= nf_flow_table_free,
 	.hook		= nf_flow_offload_ipv6_hook,
+	.hook_list	= nf_flow_offload_ipv6_hook_list,
 	.owner		= THIS_MODULE,
 };
 

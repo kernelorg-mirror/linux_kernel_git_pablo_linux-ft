@@ -18,6 +18,13 @@ struct nf_flow_rule;
 struct flow_offload;
 enum flow_offload_tuple_dir;
 
+struct nft_bulk_cb {
+	struct sk_buff *last;
+	struct flow_offload_tuple_rhash *tuplehash;
+};
+
+#define NFT_BULK_CB(skb) ((struct nft_bulk_cb *)(skb)->cb)
+
 struct nf_flow_key {
 	struct flow_dissector_key_meta			meta;
 	struct flow_dissector_key_control		control;
@@ -65,6 +72,7 @@ struct nf_flowtable_type {
 	void				(*get)(struct nf_flowtable *ft);
 	void				(*put)(struct nf_flowtable *ft);
 	nf_hookfn			*hook;
+	nf_hookfn			*hook_list;
 	struct module			*owner;
 };
 
@@ -77,7 +85,6 @@ struct nf_flowtable {
 	unsigned int			flags;		/* readonly in datapath */
 	int				priority;	/* control path (padding hole) */
 	struct rhashtable		rhashtable;	/* datapath, read-mostly members come first */
-
 	struct list_head		list;		/* slowpath parts */
 	const struct nf_flowtable_type	*type;
 	struct delayed_work		gc_work;
@@ -339,6 +346,8 @@ unsigned int nf_flow_offload_ip_hook(void *priv, struct sk_buff *skb,
 				     const struct nf_hook_state *state);
 unsigned int nf_flow_offload_ipv6_hook(void *priv, struct sk_buff *skb,
 				       const struct nf_hook_state *state);
+void __nf_flow_offload_ip_hook_list(void *priv, struct list_head *head,
+				    const struct net_device *in);
 
 #if (IS_BUILTIN(CONFIG_NF_FLOW_TABLE) && IS_ENABLED(CONFIG_DEBUG_INFO_BTF)) || \
     (IS_MODULE(CONFIG_NF_FLOW_TABLE) && IS_ENABLED(CONFIG_DEBUG_INFO_BTF_MODULES))
