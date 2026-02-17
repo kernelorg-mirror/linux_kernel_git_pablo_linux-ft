@@ -752,6 +752,26 @@ static int nf_flow_encap_push(struct sk_buff *skb,
 	return 0;
 }
 
+static void nft_flow_v4_push_hdrs_list(struct net *net, struct sk_buff *first,
+				       struct flow_offload_tuple *other_tuple,
+				       __be32 *ip_daddr)
+{
+	struct sk_buff *skb, *nskb;
+
+	skb_list_walk_safe(first, skb, nskb) {
+		if (nf_flow_tunnel_v4_push(net, skb, other_tuple, ip_daddr) < 0) {
+			skb_mark_not_on_list(skb);
+			kfree_skb(skb);
+			continue;
+		}
+		if (nf_flow_encap_push(skb, other_tuple) < 0) {
+			skb_mark_not_on_list(skb);
+			kfree_skb(skb);
+			continue;
+		}
+	}
+}
+
 static void nft_bulk_receive(struct list_head *head, struct sk_buff *skb)
 {
 	const struct iphdr *iph;
@@ -855,19 +875,23 @@ static void nf_flow_neigh_xmit_list(struct sk_buff *skb, struct net_device *outd
 }
 
 void __nf_flow_offload_ip_hook_list(void *priv, struct list_head *head,
-				    const struct net_device *in)
+				    const struct nf_hook_state *state)
 {
 	struct flow_offload_tuple_rhash *tuplehash;
 	struct nf_flowtable *flow_table = priv;
+	struct flow_offload_tuple *other_tuple;
+	enum flow_offload_tuple_dir dir;
 	struct nf_flowtable_ctx ctx = {
-		.in	= in,
+		.in	= state->in,
 	};
+	struct flow_offload *flow;
 	struct sk_buff *skb, *n;
 	struct neighbour *neigh;
 	LIST_HEAD(bulk_head);
 	LIST_HEAD(bulk_list);
 	LIST_HEAD(acc_list);
 	struct rtable *rt;
+	__be32 ip_daddr;
 	int ret;
 
 	list_for_each_entry_safe(skb, n, head, list) {
@@ -916,7 +940,15 @@ void __nf_flow_offload_ip_hook_list(void *priv, struct list_head *head,
 		skb_dst_set_noref(skb, tuplehash->tuple.dst_cache);
 		rt = (struct rtable *)skb_dst(skb);
 
-		neigh = ip_neigh_gw4(rt->dst.dev, rt_nexthop(rt, ip_hdr(skb)->daddr));
+		dir = tuplehash->tuple.dir;
+		flow = container_of(tuplehash, struct flow_offload, tuplehash[dir]);
+		other_tuple = &flow->tuplehash[!dir].tuple;
+		ip_daddr = other_tuple->src_v4.s_addr;
+
+		if (other_tuple->tun_num || other_tuple->encap_num)
+			nft_flow_v4_push_hdrs_list(state->net, skb, other_tuple, &ip_daddr);
+
+		neigh = ip_neigh_gw4(rt->dst.dev, rt_nexthop(rt, ip_daddr));
 		if (IS_ERR(neigh)) {
 			kfree_skb_list(skb);
 			continue;
