@@ -323,6 +323,8 @@ nfnl_hook_entries_head(u8 pf, unsigned int hook, struct net *net, const char *de
 #ifdef CONFIG_NETFILTER_INGRESS
 		if (hook == NF_NETDEV_INGRESS)
 			return rcu_dereference(netdev->nf_hooks_ingress);
+		if (hook == NF_NETDEV_EARLY_INGRESS)
+			return rcu_dereference(netdev->nf_hooks_early_ingress);
 #endif
 #ifdef CONFIG_NETFILTER_EGRESS
 		if (hook == NF_NETDEV_EGRESS)

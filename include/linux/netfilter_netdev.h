@@ -148,4 +148,52 @@ static inline void nf_hook_netdev_init(struct net_device *dev)
 #endif
 }
 
+#ifdef CONFIG_NETFILTER_INGRESS
+static inline bool nf_hook_early_ingress_active(const struct sk_buff *skb)
+{
+#ifdef CONFIG_JUMP_LABEL
+	if (!static_key_false(&nf_hooks_needed[NFPROTO_NETDEV][NF_NETDEV_EARLY_INGRESS]))
+		return false;
+#endif
+	return rcu_access_pointer(skb->dev->nf_hooks_early_ingress);
+}
+
+/* caller must hold rcu_read_lock */
+static inline void nf_hook_early_ingress_list(struct list_head *head)
+{
+       struct sk_buff *skb = list_first_entry_or_null(head, struct sk_buff, list);
+       struct nf_hook_state state;
+       struct nf_hook_entries *e;
+       struct net_device *dev;
+
+       if (WARN_ON_ONCE(!skb))
+	       return;
+
+       dev = skb->dev;
+       e = rcu_dereference(dev->nf_hooks_early_ingress);
+
+       /* Must recheck the ingress hook head, in the event it became NULL
+	* after the check in nf_hook_ingress_active evaluated to true.
+	*/
+       if (unlikely(!e))
+	       return;
+
+       nf_hook_state_init(&state, NF_NETDEV_EARLY_INGRESS,
+			  NFPROTO_NETDEV, dev, NULL, NULL,
+			  dev_net(dev), NULL);
+       state.skb_list = head;
+       __nf_hook_slow_list(skb, &state, e, 0);
+}
+#else /* CONFIG_NETFILTER_INGRESS */
+static inline int nf_hook_early_ingress_active(struct sk_buff *skb)
+{
+	return 0;
+}
+
+static inline void nf_hook_early_ingress_list(struct list_head *head)
+{
+	return 0;
+}
+#endif /* CONFIG_NETFILTER_INGRESS */
+
 #endif /* _NETFILTER_NETDEV_H_ */

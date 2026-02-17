@@ -6362,6 +6362,8 @@ void netif_receive_skb_list_internal(struct list_head *head)
 	struct sk_buff *skb, *next;
 	LIST_HEAD(sublist);
 
+	nf_hook_early_ingress_list(head);
+
 	list_for_each_entry_safe(skb, next, head, list) {
 		net_timestamp_check(READ_ONCE(net_hotdata.tstamp_prequeue),
 				    skb);

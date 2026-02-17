@@ -293,13 +293,18 @@ nf_hook_entry_head(struct net *net, int pf, unsigned int hooknum,
 #endif
 #ifdef CONFIG_NETFILTER_INGRESS
 	case NFPROTO_INET:
-		if (WARN_ON_ONCE(hooknum != NF_INET_INGRESS))
+		if (WARN_ON_ONCE(hooknum != NF_INET_INGRESS &&
+				 hooknum != NF_INET_EARLY_INGRESS))
 			return NULL;
 		if (!dev || dev_net(dev) != net) {
 			WARN_ON_ONCE(1);
 			return NULL;
 		}
-		return &dev->nf_hooks_ingress;
+		if (hooknum == NF_INET_INGRESS)
+			return &dev->nf_hooks_ingress;
+		else if (hooknum == NF_INET_EARLY_INGRESS)
+			return &dev->nf_hooks_early_ingress;
+		break;
 #endif
 	case NFPROTO_IPV4:
 		if (WARN_ON_ONCE(ARRAY_SIZE(net->nf.hooks_ipv4) <= hooknum))
@@ -315,9 +320,15 @@ nf_hook_entry_head(struct net *net, int pf, unsigned int hooknum,
 	}
 
 #ifdef CONFIG_NETFILTER_INGRESS
-	if (hooknum == NF_NETDEV_INGRESS) {
+	switch (hooknum) {
+	case NF_NETDEV_EARLY_INGRESS:
+		if (dev && dev_net(dev) == net)
+			return &dev->nf_hooks_early_ingress;
+		break;
+	case NF_NETDEV_INGRESS:
 		if (dev && dev_net(dev) == net)
 			return &dev->nf_hooks_ingress;
+		break;
 	}
 #endif
 #ifdef CONFIG_NETFILTER_EGRESS
@@ -347,8 +358,12 @@ static int nf_ingress_check(struct net *net, const struct nf_hook_ops *reg,
 static inline bool __maybe_unused nf_ingress_hook(const struct nf_hook_ops *reg,
 						  int pf)
 {
-	if ((pf == NFPROTO_NETDEV && reg->hooknum == NF_NETDEV_INGRESS) ||
-	    (pf == NFPROTO_INET && reg->hooknum == NF_INET_INGRESS))
+	if ((pf == NFPROTO_NETDEV &&
+	     (reg->hooknum == NF_NETDEV_INGRESS ||
+	      reg->hooknum == NF_NETDEV_EARLY_INGRESS)) ||
+	    (pf == NFPROTO_INET &&
+	     (reg->hooknum == NF_INET_INGRESS ||
+	      reg->hooknum == NF_INET_EARLY_INGRESS)))
 		return true;
 
 	return false;
@@ -365,9 +380,16 @@ static void nf_static_key_inc(const struct nf_hook_ops *reg, int pf)
 #ifdef CONFIG_JUMP_LABEL
 	int hooknum;
 
-	if (pf == NFPROTO_INET && reg->hooknum == NF_INET_INGRESS) {
-		pf = NFPROTO_NETDEV;
-		hooknum = NF_NETDEV_INGRESS;
+	if (pf == NFPROTO_INET) {
+		if (reg->hooknum == NF_INET_INGRESS) {
+			pf = NFPROTO_NETDEV;
+			hooknum = NF_NETDEV_INGRESS;
+		} else if (reg->hooknum == NF_INET_EARLY_INGRESS) {
+			pf = NFPROTO_NETDEV;
+			hooknum = NF_NETDEV_EARLY_INGRESS;
+		} else {
+			hooknum = reg->hooknum;
+		}
 	} else {
 		hooknum = reg->hooknum;
 	}
@@ -380,9 +402,16 @@ static void nf_static_key_dec(const struct nf_hook_ops *reg, int pf)
 #ifdef CONFIG_JUMP_LABEL
 	int hooknum;
 
-	if (pf == NFPROTO_INET && reg->hooknum == NF_INET_INGRESS) {
-		pf = NFPROTO_NETDEV;
-		hooknum = NF_NETDEV_INGRESS;
+	if (pf == NFPROTO_INET) {
+		if (reg->hooknum == NF_INET_INGRESS) {
+			pf = NFPROTO_NETDEV;
+			hooknum = NF_NETDEV_INGRESS;
+		} else if (reg->hooknum == NF_INET_EARLY_INGRESS) {
+			pf = NFPROTO_NETDEV;
+			hooknum = NF_NETDEV_EARLY_INGRESS;
+		} else {
+			hooknum = reg->hooknum;
+		}
 	} else {
 		hooknum = reg->hooknum;
 	}
@@ -400,7 +429,8 @@ static int __nf_register_net_hook(struct net *net, int pf,
 	switch (pf) {
 	case NFPROTO_NETDEV:
 #ifndef CONFIG_NETFILTER_INGRESS
-		if (reg->hooknum == NF_NETDEV_INGRESS)
+		if (reg->hooknum == NF_NETDEV_INGRESS ||
+		    reg->hooknum == NF_NETDEV_EARLY_INGRESS)
 			return -EOPNOTSUPP;
 #endif
 #ifndef CONFIG_NETFILTER_EGRESS
@@ -408,15 +438,17 @@ static int __nf_register_net_hook(struct net *net, int pf,
 			return -EOPNOTSUPP;
 #endif
 		if ((reg->hooknum != NF_NETDEV_INGRESS &&
-		     reg->hooknum != NF_NETDEV_EGRESS) ||
+		     reg->hooknum != NF_NETDEV_EGRESS &&
+		     reg->hooknum != NF_NETDEV_EARLY_INGRESS) ||
 		    !reg->dev || dev_net(reg->dev) != net)
 			return -EINVAL;
 		break;
 	case NFPROTO_INET:
-		if (reg->hooknum != NF_INET_INGRESS)
+		if (reg->hooknum != NF_INET_INGRESS ||
+		    reg->hooknum != NF_INET_EARLY_INGRESS)
 			break;
 
-		err = nf_ingress_check(net, reg, NF_INET_INGRESS);
+		err = nf_ingress_check(net, reg, reg->hooknum);
 		if (err < 0)
 			return err;
 		break;
@@ -526,7 +558,8 @@ static void __nf_unregister_net_hook(struct net *net, int pf,
 void nf_unregister_net_hook(struct net *net, const struct nf_hook_ops *reg)
 {
 	if (reg->pf == NFPROTO_INET) {
-		if (reg->hooknum == NF_INET_INGRESS) {
+		if (reg->hooknum == NF_INET_INGRESS ||
+		    reg->hooknum == NF_INET_EARLY_INGRESS) {
 			__nf_unregister_net_hook(net, NFPROTO_INET, reg);
 		} else {
 			__nf_unregister_net_hook(net, NFPROTO_IPV4, reg);
@@ -556,7 +589,8 @@ int nf_register_net_hook(struct net *net, const struct nf_hook_ops *reg)
 	int err;
 
 	if (reg->pf == NFPROTO_INET) {
-		if (reg->hooknum == NF_INET_INGRESS) {
+		if (reg->hooknum == NF_INET_INGRESS ||
+		    reg->hooknum == NF_INET_EARLY_INGRESS) {
 			err = __nf_register_net_hook(net, NFPROTO_INET, reg);
 			if (err < 0)
 				return err;
@@ -665,6 +699,34 @@ void nf_hook_slow_list(struct list_head *head, struct nf_hook_state *state,
 	list_splice(&sublist, head);
 }
 EXPORT_SYMBOL(nf_hook_slow_list);
+
+/* Returns 1 if okfn() needs to be executed by the caller,
+ * -EPERM for NF_DROP, 0 otherwise.  Caller must hold rcu_read_lock. */
+int __nf_hook_slow_list(struct sk_buff *skb, struct nf_hook_state *state,
+			const struct nf_hook_entries *e, unsigned int s)
+{
+	unsigned int verdict;
+
+	for (; s < e->num_hook_entries; s++) {
+		verdict = nf_hook_entry_hookfn(&e->hooks[s], skb, state);
+
+		if (list_empty(state->skb_list))
+			return 0;
+
+		switch (verdict & NF_VERDICT_MASK) {
+		case NF_ACCEPT:
+			break;
+		default:
+			/* Implicit handling for NF_DROP and NF_STOLEN, as well
+			 * as any other non conventional verdicts.
+			 */
+			return 0;
+		}
+	}
+
+	return 1;
+}
+EXPORT_SYMBOL(__nf_hook_slow_list);
 
 /* This needs to be compiled in any case to avoid dependencies between the
  * nfnetlink_queue code and nf_conntrack.
