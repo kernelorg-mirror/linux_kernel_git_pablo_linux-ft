@@ -8969,7 +8969,8 @@ static int nft_flowtable_parse_hook(const struct nft_ctx *ctx,
 		}
 
 		hooknum = ntohl(nla_get_be32(tb[NFTA_FLOWTABLE_HOOK_NUM]));
-		if (hooknum != NF_NETDEV_INGRESS)
+		if (hooknum != NF_NETDEV_INGRESS &&
+		    hooknum != NF_NETDEV_EARLY_INGRESS)
 			return -EOPNOTSUPP;
 
 		priority = ntohl(nla_get_be32(tb[NFTA_FLOWTABLE_HOOK_PRIORITY]));
@@ -9008,7 +9009,14 @@ static int nft_flowtable_parse_hook(const struct nft_ctx *ctx,
 			ops->hooknum		= flowtable_hook->num;
 			ops->priority		= flowtable_hook->priority;
 			ops->priv		= &flowtable->data;
-			ops->hook		= flowtable->data.type->hook;
+			switch (ops->hooknum) {
+			case NF_NETDEV_INGRESS:
+				ops->hook	= flowtable->data.type->hook;
+				break;
+			case NF_NETDEV_EARLY_INGRESS:
+				ops->hook	= flowtable->data.type->hook_list;
+				break;
+			}
 			ops->hook_ops_type	= NF_HOOK_OP_NFT_FT;
 		}
 	}
