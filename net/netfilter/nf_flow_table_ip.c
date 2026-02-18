@@ -1364,6 +1364,26 @@ nf_flow_offload_ipv6_hook(void *priv, struct sk_buff *skb,
 }
 EXPORT_SYMBOL_GPL(nf_flow_offload_ipv6_hook);
 
+static void nft_flow_v6_push_hdrs_list(struct net *net, struct sk_buff *first,
+				       struct flow_offload_tuple *other_tuple,
+				       struct in6_addr **ip6_daddr, int encap_limit)
+{
+	struct sk_buff *skb, *nskb;
+
+	skb_list_walk_safe(first, skb, nskb) {
+		if (nf_flow_tunnel_v6_push(net, skb, other_tuple, ip6_daddr, encap_limit) < 0) {
+			skb_mark_not_on_list(skb);
+			kfree_skb(skb);
+			continue;
+		}
+		if (nf_flow_encap_push(skb, other_tuple) < 0) {
+			skb_mark_not_on_list(skb);
+			kfree_skb(skb);
+			continue;
+		}
+	}
+}
+
 static void nft_bulk_ipv6_receive(struct list_head *head, struct sk_buff *skb)
 {
 	const struct in6_addr *daddr;
@@ -1433,9 +1453,13 @@ void __nf_flow_offload_ipv6_hook_list(void *priv, struct list_head *head,
 {
 	struct flow_offload_tuple_rhash *tuplehash;
 	struct nf_flowtable *flow_table = priv;
+	struct flow_offload_tuple *other_tuple;
+	enum flow_offload_tuple_dir dir;
 	struct nf_flowtable_ctx ctx = {
 		.in	= state->in,
 	};
+	struct in6_addr *ip6_daddr;
+	struct flow_offload *flow;
 	struct sk_buff *skb, *n;
 	struct neighbour *neigh;
 	LIST_HEAD(bulk_head);
@@ -1490,6 +1514,15 @@ void __nf_flow_offload_ipv6_hook_list(void *priv, struct list_head *head,
 		tuplehash = NFT_BULK_CB(skb)->tuplehash;
 		skb_dst_set_noref(skb, tuplehash->tuple.dst_cache);
 		rt = (struct rt6_info *)skb_dst(skb);
+
+		dir = tuplehash->tuple.dir;
+		flow = container_of(tuplehash, struct flow_offload, tuplehash[dir]);
+		other_tuple = &flow->tuplehash[!dir].tuple;
+		ip6_daddr = &other_tuple->src_v6;
+
+		if (other_tuple->tun_num || other_tuple->encap_num)
+			nft_flow_v6_push_hdrs_list(state->net, skb, other_tuple, &ip6_daddr,
+						   IPV6_DEFAULT_TNL_ENCAP_LIMIT);
 
 		neigh = ip_neigh_gw6(rt->dst.dev, rt6_nexthop(rt, &ipv6_hdr(skb)->daddr));
 		if (IS_ERR(neigh)) {
