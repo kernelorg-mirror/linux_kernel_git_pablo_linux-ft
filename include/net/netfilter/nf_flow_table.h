@@ -348,6 +348,8 @@ unsigned int nf_flow_offload_ipv6_hook(void *priv, struct sk_buff *skb,
 				       const struct nf_hook_state *state);
 void __nf_flow_offload_ip_hook_list(void *priv, struct list_head *head,
 				    const struct nf_hook_state *state);
+void __nf_flow_offload_ipv6_hook_list(void *priv, struct list_head *head,
+				      const struct nf_hook_state *state);
 
 #if (IS_BUILTIN(CONFIG_NF_FLOW_TABLE) && IS_ENABLED(CONFIG_DEBUG_INFO_BTF)) || \
     (IS_MODULE(CONFIG_NF_FLOW_TABLE) && IS_ENABLED(CONFIG_DEBUG_INFO_BTF_MODULES))
