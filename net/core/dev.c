@@ -4920,6 +4920,163 @@ drop:
 }
 EXPORT_SYMBOL(__dev_direct_xmit);
 
+static int dev_queue_xmit_skb_list(struct sk_buff *skb, struct Qdisc *q,
+				   struct net_device *dev,
+				   struct netdev_queue *txq)
+{
+	struct sk_buff *next, *to_free = NULL, *to_free2 = NULL;
+	spinlock_t *root_lock = qdisc_lock(q);
+	struct llist_node *ll_list, *first_n;
+	unsigned long defer_count = 0;
+	int rc = -1;
+
+	tcf_set_drop_reason(skb, SKB_DROP_REASON_QDISC_DROP);
+
+	if (q->flags & TCQ_F_NOLOCK) {
+		if (q->flags & TCQ_F_CAN_BYPASS && nolock_qdisc_is_empty(q) &&
+		    qdisc_run_begin(q)) {
+			/* Retest nolock_qdisc_is_empty() within the protection
+			 * of q->seqlock to protect from racing with requeuing.
+			 */
+			if (unlikely(!nolock_qdisc_is_empty(q))) {
+				to_free2 = qdisc_run_end(q);
+				goto free_skbs;
+			}
+
+			if (sch_direct_xmit(skb, q, dev, txq, NULL, false) &&
+			    !nolock_qdisc_is_empty(q))
+				__qdisc_run(q);
+
+			to_free2 = qdisc_run_end(q);
+			rc = NET_XMIT_SUCCESS;
+			goto free_skbs;
+		}
+	}
+
+	/* Transform skb list to llist in reverse order to splice this batch
+	 * into the defer_list. The next field of skb chain and llist use the
+	 * memory layout.
+	 */
+	ll_list = llist_reverse_order(&skb->ll_node);
+
+	/* Open code llist_add(&skb->ll_node, &q->defer_list) + queue limit.
+	 * In the try_cmpxchg() loop, we want to increment q->defer_count
+	 * at most once to limit the number of skbs in defer_list.
+	 * We perform the defer_count increment only if the list is not empty,
+	 * because some arches have slow atomic_long_inc_return().
+	 */
+	first_n = READ_ONCE(q->defer_list.first);
+	do {
+		if (first_n && !defer_count) {
+			defer_count = atomic_long_inc_return(&q->defer_count);
+			if (unlikely(defer_count > READ_ONCE(net_hotdata.qdisc_max_burst))) {
+				kfree_skb_reason(skb, SKB_DROP_REASON_QDISC_BURST_DROP);
+				return NET_XMIT_DROP;
+			}
+                }
+		/* Splice using last skb in the reverse list. */
+		skb->ll_node.next = first_n;
+	} while (!try_cmpxchg(&q->defer_list.first, &first_n, ll_list));
+
+	/* If defer_list was not empty, we know the cpu which queued
+	 * the first skb will process the whole list for us.
+	 */
+	if (first_n)
+		return NET_XMIT_SUCCESS;
+
+	spin_lock(root_lock);
+
+	ll_list = llist_del_all(&q->defer_list);
+	/* There is a small race because we clear defer_count not atomically
+	 * with the prior llist_del_all(). This means defer_list could grow
+	 * over qdisc_max_burst.
+	 */
+	atomic_long_set(&q->defer_count, 0);
+
+	ll_list = llist_reverse_order(ll_list);
+
+	if (unlikely(test_bit(__QDISC_STATE_DEACTIVATED, &q->state))) {
+		llist_for_each_entry_safe(skb, next, ll_list, ll_node)
+			__qdisc_drop(skb, &to_free);
+		rc = NET_XMIT_DROP;
+		goto unlock;
+	}
+
+	if ((q->flags & TCQ_F_CAN_BYPASS) && !qdisc_qlen(q) &&
+	    !llist_next(ll_list) && qdisc_run_begin(q)) {
+		/*
+		 * This is a work-conserving queue; there are no old skbs
+		 * waiting to be sent out; and the qdisc is not running -
+		 * xmit the skb directly.
+		 */
+		DEBUG_NET_WARN_ON_ONCE(skb != llist_entry(ll_list,
+							  struct sk_buff,
+							  ll_node));
+		qdisc_bstats_update(q, skb);
+		if (sch_direct_xmit(skb, q, dev, txq, root_lock, true))
+			__qdisc_run(q);
+		to_free2 = qdisc_run_end(q);
+		rc = NET_XMIT_SUCCESS;
+	}
+unlock:
+	spin_unlock(root_lock);
+
+free_skbs:
+	tcf_kfree_skb_list(to_free);
+	tcf_kfree_skb_list(to_free2);
+	return rc;
+}
+
+int dev_queue_xmit_list(struct sk_buff *skb)
+{
+	struct net_device *dev = skb->dev;
+	struct netdev_queue *txq;
+	struct sk_buff *iter;
+	struct Qdisc *q;
+	int rc;
+
+	/* Disable soft irqs for various locks below. Also
+	 * stops preemption for RCU.
+	 */
+	rcu_read_lock_bh();
+
+	/* Intentionally, no egress hooks here. This is called from the ingress
+	 * path, which should have already classified packets before calling
+	 * this function.
+	 */
+
+	txq = netdev_tx_queue_mapping(dev, skb);
+	if (!txq)
+		txq = netdev_core_pick_tx(dev, skb, NULL);
+
+	q = rcu_dereference_bh(txq->qdisc);
+
+	iter = skb;
+	while (iter) {
+		dev_dst_drop(dev, iter);
+		skb_copy_queue_mapping(iter, skb);
+		iter = iter->next;
+	}
+
+	if (q->enqueue) {
+		rc = dev_queue_xmit_skb_list(skb, q, dev, txq);
+		goto out;
+	}
+
+	rc = dev_noqueue_xmit_list(skb, dev, txq);
+	rcu_read_unlock_bh();
+
+	if (rc < 0) {
+		dev_core_stats_tx_dropped_inc(dev);
+		kfree_skb_list(skb);
+	}
+	return rc;
+out:
+	rcu_read_unlock_bh();
+	return rc;
+}
+EXPORT_SYMBOL(dev_queue_xmit_list);
+
 /*************************************************************************
  *			Receiver routines
  *************************************************************************/
